@@ -1,3 +1,3 @@
 numpy
 matplotlib
-/${REPO_DIR}/darts-0.1.0-cp37-cp37m-linux_x86_64.whl
+/${REPO_DIR}/darts-0.1.0-cp38-cp38m-linux_x86_64.whl
