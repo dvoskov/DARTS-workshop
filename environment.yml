@@ -7,4 +7,4 @@ dependencies:
   - pip
   - pip:
     - matplotlib
-    - darts-0.1.0-cp38-cp38-linux_x86_64.whl
+    - /tmp/darts-0.1.0-cp38-cp38-linux_x86_64.whl
