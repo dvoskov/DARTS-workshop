@@ -4,3 +4,6 @@ scipy
 pandas
 openpyxl
 plotly
+meshio==3.3.1 
+xlrd
+pykrige
