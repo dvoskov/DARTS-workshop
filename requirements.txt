@@ -3,3 +3,4 @@ matplotlib
 scipy
 pandas
 openpyxl
+plotly
