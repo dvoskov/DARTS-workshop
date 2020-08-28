@@ -1,1 +1,2 @@
-darts.whl
+numpy
+matplotlib
