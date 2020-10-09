@@ -25,13 +25,15 @@ def get_table_keyword(file_name, keyword):
 def load_single_keyword(file_name, keyword, def_len=1000, cache=0):
     read_data_mode = 0
     pos = 0
+    cache_filename = file_name + '.' + keyword + '.cache'
 
     if cache:
         # if caching is enabled and cache file is already created, read from it
         import os
-        if os.path.isfile(file_name+keyword+'.cache'):
-            a = np.fromfile(file_name+keyword+'.cache')
-            print(" %d values have been read from cache." % len(a))
+        if os.path.isfile(cache_filename):
+            print("Reading %s from %s..." % (keyword, cache_filename), end='', flush=True)
+            a = np.fromfile(cache_filename)
+            print(" %d values have been read." % len(a))
             return a
 
     # start with specified (or default) array length
@@ -108,9 +110,20 @@ def load_single_keyword(file_name, keyword, def_len=1000, cache=0):
 
     if cache:
         # if caching is enabled, save to cache file
-        a.tofile(file_name+keyword+'.cache')
+        a.tofile(cache_filename)
         print(" %d values have been read and cached." % pos)
     else:
         print(" %d values have been read." % pos)
 
     return a
+
+def save_few_keywords(fname, keys, data):
+    f = open(fname, 'w')
+    for id in range(len(keys)):
+        f.write(keys[id])
+        for i, val in enumerate(data[id]):
+            if i % 4 == 0: f.write('\n')
+            f.write("%12.10f" % val)
+            f.write('\t')
+        f.write('\n' + '/' + '\n')
+    f.close()

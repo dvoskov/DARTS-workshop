@@ -191,7 +191,7 @@ class DeadOil:
 
         self.water_inj_stream = value_vector([1 - 3 * min_z])
         self.new_bhp_water_inj = lambda bhp: bhp_inj_well_control(bhp, self.water_inj_stream)
-        self.new_rate_water_inj = lambda rate: rate_inj_well_control(self.phases, 0, self.n_components,
+        self.new_rate_water_inj = lambda rate: rate_inj_well_control(self.rate_phases, 0, self.n_components,
                                                                      self.n_components,
                                                                      rate,
                                                                      self.water_inj_stream, self.rate_itor)

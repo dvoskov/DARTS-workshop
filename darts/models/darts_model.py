@@ -26,6 +26,7 @@ class DartsModel:
         self.timer = timer_node()  # Create time_node object for time record
         self.timer.start()  # Start time record
         self.timer.node["simulation"] = timer_node()  # Create timer.node called "simulation" to record simulation time
+        self.timer.node["newton update"] = timer_node()
         self.timer.node[
             "initialization"] = timer_node()  # Create timer.node called "initialization" to record initialization time
         self.timer.node["initialization"].start()  # Start recording "initialization" time
@@ -33,6 +34,7 @@ class DartsModel:
         self.params = sim_params()  # Create sim_params object to set simulation parameters
 
         self.timer.node["initialization"].stop()  # Stop recording "initialization" time
+
 
     def init(self):
         """
@@ -75,7 +77,7 @@ class DartsModel:
             runtime = self.runtime
         self.physics.engine.run(runtime)
 
-    def run_python(self, days=0, restart_dt=0, log_3d_body_path=0):
+    def run_python(self, days=0, restart_dt=0, log_3d_body_path=0, timestep_python=False):
         if days:
             runtime = days
         else:
@@ -83,10 +85,10 @@ class DartsModel:
 
         mult_dt = self.params.mult_ts
         max_dt = self.params.max_ts
-        e = self.physics.engine
+        self.e = self.physics.engine
 
         # get current engine time
-        t = e.t
+        t = self.e.t
 
         # same logic as in engine.run
         if fabs(t) < 1e-15:
@@ -104,13 +106,15 @@ class DartsModel:
             self.body_path_start()
 
         while t < runtime:
-            converged = e.run_timestep(dt, t)
-
+            if timestep_python:
+                 converged = self.e.run_timestep(dt, t)
+            else:
+                 converged = self.run_timestep_python(dt, t)
             if converged:
                 t += dt
                 ts = ts + 1
-                print("# %d \tT = %3g\tDT = %2g\tNI = %d\tLI=%d" % (
-                    ts, t, dt, e.n_newton_last_dt, e.n_linear_last_dt))
+                print("# %d \tT = %3g\tDT = %2g\tNI = %d\tLI=%d"
+                      % (ts, t, dt, self.e.n_newton_last_dt, self.e.n_linear_last_dt))
 
                 dt *= mult_dt
                 if dt > max_dt:
@@ -133,11 +137,11 @@ class DartsModel:
                 if dt < 1e-8:
                     break
         # update current engine time
-        e.t = runtime
+        self.e.t = runtime
 
-        print("TS = %d(%d), NI = %d(%d), LI = %d(%d)" % (e.stat.n_timesteps_total, e.stat.n_timesteps_wasted,
-                                                         e.stat.n_newton_total, e.stat.n_newton_wasted,
-                                                         e.stat.n_linear_total, e.stat.n_linear_wasted))
+        print("TS = %d(%d), NI = %d(%d), LI = %d(%d)" % (self.e.stat.n_timesteps_total, self.e.stat.n_timesteps_wasted,
+                                                         self.e.stat.n_newton_total, self.e.stat.n_newton_wasted,
+                                                         self.e.stat.n_linear_total, self.e.stat.n_linear_wasted))
 
     def load_restart_data(self, filename='restart.pkl'):
         """
@@ -163,7 +167,7 @@ class DartsModel:
         arr_n = np.copy(self.physics.engine.op_vals_arr_n)
         data = [t, X, arr_n]
         with open(filename, "wb") as fp:
-            pickle.dump(data, fp, pickle.HIGHEST_PROTOCOL)
+            pickle.dump(data, fp, 4)
 
     # overwrite key to save results over existed
     # diff_norm_normalized_tol defines tolerance for L2 norm of final solution difference , normalized by amount of blocks and variable range
@@ -194,9 +198,9 @@ class DartsModel:
                 if diff_norm_normalized > diff_norm_normalized_tol or diff_abs_max_normalized > diff_abs_max_normalized_tol:
                     fail += 1
                     print(
-                        '#%d solution check failed for variable %s: Normalized difference norm  %.2E (tol %.2E), Normalized abs difference max %.2E (tol %.2E)' \
-                        % (fail, self.physics.vars[v], diff_norm_normalized, diff_norm_normalized_tol,
-                           diff_abs_max_normalized, diff_abs_max_normalized_tol))
+                        '#%d solution check failed for variable %s (range %f): L2(diff)/len(diff)/range = %.2E (tol %.2E), max(abs(diff))/range %.2E (tol %.2E), max(abs(diff)) = %.2E' \
+                        % (fail, self.physics.vars[v], sol_range, diff_norm_normalized, diff_norm_normalized_tol,
+                           diff_abs_max_normalized, diff_abs_max_normalized_tol, np.max(diff_abs)))
             for key, value in sorted(data.items()):
                 if key == 'solution' or type(value) != int:
                     continue
@@ -264,7 +268,7 @@ class DartsModel:
             file_name = 'perf_' + platform.system().lower()[:3] + '.pkl'
         data = self.get_performance_data()
         with open(file_name, "wb") as fp:
-            pickle.dump(data, fp, pickle.HIGHEST_PROTOCOL)
+            pickle.dump(data, fp, 4)
 
     @staticmethod
     def load_performance_data(file_name=''):
@@ -637,3 +641,43 @@ class DartsModel:
             local_cell_data[self.physics.vars[v]] = X[v:nb * nv:nv].astype(vars_data_dtype)
 
         self.reservoir.export_vtk(file_name, t, local_cell_data, global_cell_data, export_grid_data)
+
+    # destructor to force to destroy all created C objects and free memory
+    def __del__(self):
+        # first destroy all objects in physics
+        attrs = vars(self.physics)
+        physics_attrs = list(attrs.keys())
+        for name in physics_attrs:
+            delattr(self.physics, name)
+
+        # then - in the model itself
+        attrs = vars(self)
+        physics_attrs = list(attrs.keys())
+        for name in physics_attrs:
+            delattr(self, name)
+
+
+    def run_timestep_python(self, dt, t):
+        max_newt = self.params.max_i_newton
+        self.e.n_linear_last_dt = 0
+        well_tolerance_coefficient = 1e2
+        self.timer.node['simulation'].start()
+        for i in range(max_newt+1):
+            self.e.run_single_newton_iteration(dt)
+            self.e.newton_residual_last_dt = self.e.calc_newton_residual()
+            self.e.well_residual_last_dt = self.e.calc_well_residual()
+            self.e.n_newton_last_dt = i
+            #  check tolerance if it converges
+            if ((self.e.newton_residual_last_dt < self.params.tolerance_newton and self.e.well_residual_last_dt < well_tolerance_coefficient * self.params.tolerance_newton )
+                    or self.e.n_newton_last_dt == self.params.max_i_newton):
+                if (i > 0):  # min_i_newton
+                    break
+            r_code = self.e.solve_linear_equation()
+            self.timer.node["newton update"].start()
+            self.e.apply_newton_update(dt)
+            self.timer.node["newton update"].stop()
+        # End of newton loop
+        converged = self.e.post_newtonloop(dt, t)
+        self.timer.node['simulation'].stop()
+        return converged
+

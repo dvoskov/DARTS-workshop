@@ -12,7 +12,7 @@ class StructReservoir:
     def __init__(self, timer, nx: int, ny: int, nz: int,
                  dx, dy, dz,
                  permx, permy, permz,
-                 poro, depth, actnum=1, global_to_local = 0, op_num=0, coord=0, zcorn=0):
+                 poro, depth, actnum=1, global_to_local = 0, op_num=0, coord=0, zcorn=0, is_cpg=False):
 
         """
         Class constructor method
@@ -59,11 +59,15 @@ class StructReservoir:
                             'op_num': op_num,
                             }
         self.discretizer = StructDiscretizer(nx=nx, ny=ny, nz=nz, dx=dx, dy=dy, dz=dz, permx=permx, permy=permy,
-                                             permz=permz, global_to_local = global_to_local)
+                                             permz=permz, global_to_local = global_to_local, coord=coord, zcorn=zcorn,
+                                             is_cpg=is_cpg)
 
         self.timer.node['initialization'].node['connection list generation'] = timer_node()
         self.timer.node['initialization'].node['connection list generation'].start()
-        cell_m, cell_p, tran, tran_thermal = self.discretizer.calc_structured_discr()
+        if self.discretizer.is_cpg:
+            cell_m, cell_p, tran, tran_thermal = self.discretizer.calc_cpg_discr()
+        else:
+            cell_m, cell_p, tran, tran_thermal = self.discretizer.calc_structured_discr()
         self.timer.node['initialization'].node['connection list generation'].stop()
 
         volume = self.discretizer.calc_volumes()
@@ -174,7 +178,11 @@ class StructReservoir:
             if len(well.perforations) == 0:
                 well.well_head_depth = self.depth[res_block_local]
                 well.well_body_depth = well.well_head_depth
-                well.segment_depth_increment = self.discretizer.len_cell_zdir[i - 1, j - 1, k - 1]
+                if self.discretizer.is_cpg:
+                    dx, dy, dz = self.discretizer.calc_cell_dimensions(i - 1, j - 1, k - 1)
+                    well.segment_depth_increment = dz
+                else:
+                    well.segment_depth_increment = self.discretizer.len_cell_zdir[i - 1, j - 1, k - 1]
                 well.segment_volume *= well.segment_depth_increment
             well.perforations = well.perforations + [(well_block, res_block_local, well_index)]
             if verbose:
@@ -188,6 +196,21 @@ class StructReservoir:
         self.mesh.add_wells(ms_well_vector(self.wells))
         self.mesh.reverse_and_sort()
         self.mesh.init_grav_coef()
+
+    def get_cell_cpg_widths(self):
+        assert(self.discretizer.is_cpg == True)
+        dx = np.zeros(self.nx * self.ny * self.nz)
+        dy = np.zeros(self.nx * self.ny * self.nz)
+        dz = np.zeros(self.nx * self.ny * self.nz)
+        for k in range(self.nz):
+            for j in range(self.ny):
+                for i in range(self.nx):
+                    id = i + self.nx * (j + k * self.ny)
+                    dx[id], dy[id], dz[id] = self.discretizer.calc_cell_dimensions(i, j, k)
+        dx *= self.global_data['actnum']
+        dy *= self.global_data['actnum']
+        dz *= self.global_data['actnum']
+        return dx, dy, dz
 
     def export_vtk(self, file_name, t, local_cell_data, global_cell_data, export_constant_data=True):
 
@@ -228,7 +251,7 @@ class StructReservoir:
             vtk_file_name = hl.gridToVTK(vtk_file_name, self.vtk_x, self.vtk_y, self.vtk_z, cellData=cell_data)
         else:
             for key, value in cell_data.items():
-                self.vtkobj.AppendScalarData(key, cell_data[key])
+                self.vtkobj.AppendScalarData(key, cell_data[key][self.global_data['actnum'] == 1])
 
             vtk_file_name = self.vtkobj.Write2VTU(vtk_file_name)
             if len(self.vtk_filenames_and_times) == 0:
@@ -427,5 +450,5 @@ class StructReservoir:
         self.vtkobj.GRDECL_Data.NZ = self.nz
         self.vtkobj.GRDECL_Data.N = self.n
         self.vtkobj.GRDECL_Data.GRID_type = 'CornerPoint'
-        self.vtkobj.GRDECL2VTK()
+        self.vtkobj.GRDECL2VTK(self.global_data['actnum'])
         #self.vtkobj.decomposeModel()

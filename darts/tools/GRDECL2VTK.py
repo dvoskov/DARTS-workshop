@@ -65,7 +65,7 @@ class GeologyModel:
         self.GRDECL_Data.fname=filename
         self.GRDECL_Data.read_GRDECL()
 
-    def GRDECL2VTK(self):
+    def GRDECL2VTK(self, actnum):
         #* Convert corner point grid/cartesian grid into VTK unstructure grid
         print('[Geometry] Converting GRDECL to Paraview Hexahedron mesh data....')
         NX,NY,NZ=self.GRDECL_Data.NX,self.GRDECL_Data.NY,self.GRDECL_Data.NZ
@@ -94,16 +94,18 @@ class GeologyModel:
             for k in range(NZ):
                 for j in range(NY):
                     for i in range(NX):
-                        for pi in range(8):
-                            #Convert GRDECL node index convention to VTK convention
-                            #https://www.vtk.org/wp-content/uploads/2015/04/file-formats.pdf
-                            #0,1,2,3(GRDECL)->0,1,3,2(VTK,anti-clockwise)
-                            if(pi==2 or pi==6): VTKid=pi+1
-                            elif(pi==3 or pi==7): VTKid=pi-1 
-                            else: VTKid=pi
-                            Cell.GetPointIds().SetId(pi,cellid*8+VTKid)
-                        cellArray.InsertNextCell(Cell)
-                        cellid+=1
+                        ptid = i + NX * (j + NY * k)
+                        if actnum[ptid]:
+                            for pi in range(8):
+                                #Convert GRDECL node index convention to VTK convention
+                                #https://www.vtk.org/wp-content/uploads/2015/04/file-formats.pdf
+                                #0,1,2,3(GRDECL)->0,1,3,2(VTK,anti-clockwise)
+                                if(pi==2 or pi==6): VTKid=pi+1
+                                elif(pi==3 or pi==7): VTKid=pi-1
+                                else: VTKid=pi
+                                Cell.GetPointIds().SetId(pi,ptid*8+VTKid)
+                            cellArray.InsertNextCell(Cell)
+                            cellid+=1
             
             self.VTK_Grids.SetCells(Cell.GetCellType(), cellArray)
 

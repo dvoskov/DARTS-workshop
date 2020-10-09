@@ -226,7 +226,8 @@ class Wedge(ControlVolume):
         # Determine array with five-possible tetrahedrons:
         nodes_array_tetras = np.array([[0, 1, 2, 4],
                                        [0, 3, 4, 5],
-                                       [0, 1, 2, 5]])
+                                       [0, 2, 4, 5]])
+        self.volume = 0
 
         # Loop over all tetrahedrons:
         for jj, ith_tetra in enumerate(nodes_array_tetras):
