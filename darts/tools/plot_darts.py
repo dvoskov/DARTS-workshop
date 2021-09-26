@@ -2,6 +2,13 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+def plot_phase_rate_darts(well_name, darts_df, ph, style='-', color='#00A6D6', ax=None, alpha=1):
+    search_str = well_name + ' : ' + ph + ' rate'
+    ax = darts_df.plot(x='time', y=[col for col in darts_df.columns if search_str in col], style=style, color=color,
+                       ax=ax, alpha=alpha)
+
+    plt.show(block=False)
+    return ax
 
 def plot_bhp_darts(well_name, darts_df, style='-', color='#00A6D6', ax=None):
     search_str = well_name + ' : BHP'

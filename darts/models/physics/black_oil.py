@@ -1,10 +1,12 @@
-from darts.engines import *
-from darts.physics import *
-from darts.tools.keyword_file_tools import *
 from math import fabs
+
+from darts.engines import *
+
+from darts.models.physics.physics_base import PhysicsBase
 from darts.models.physics.saturation_initialization.sat_z import *
 
-class BlackOil:
+
+class BlackOil(PhysicsBase):
     """"
        Class to generate blackoil physics, including
         Important definitions:
@@ -15,32 +17,49 @@ class BlackOil:
             - property_evaluator
             - well_control (rate, bhp)
     """
-    def __init__(self, timer, physics_filename, n_points, min_p, max_p, min_z):
+
+    def __init__(self, timer, physics_filename, n_points, min_p, max_p, min_z, max_z, negative_zc_strategy=0,
+                 platform='cpu', itor_type='multilinear', itor_mode='adaptive', itor_precision='d', cache=True):
         """"
-           Initialize BlackOil class.
+           Initialize Compositional class.
            Arguments:
                 - timer: time recording object
                 - physics_filename: filename of the physical properties
+                - components: components names
                 - n_points: number of interpolation points
                 - min_p, max_p: minimum and maximum pressure
                 - min_z: minimum composition
+                - negative_zc_strategy:
+                    0 - do nothing (default behaviour),
+                    1 - normalize the composition,
+                    2 - define x=y=z, gas
+                    3 - define x=y=z, liquid
+                - platform: target simulation platform - 'cpu' (default) or 'gpu'
+                - itor_type: 'multilinear' (default) or 'linear' interpolator type
+                - itor_mode: 'adaptive' (default) or 'static' OBL parametrization
+                - itor_precision: 'd' (default) - double precision or 's' - single precision for interpolation
         """
+        super().__init__(cache)
         self.timer = timer.node["simulation"]
         self.n_points = n_points
         self.min_p = min_p
         self.max_p = max_p
         self.min_z = min_z
+        self.max_z = max_z
         self.n_components = 3
         self.n_vars = self.n_components
         self.phases = ['gas', 'oil', 'water']
         self.vars = ['pressure', 'gas composition', 'oil composition']
         self.n_phases = len(self.phases)
+        self.n_axes_points = index_vector([n_points] * self.n_vars)
+        self.n_axes_min = value_vector([min_p] + [min_z] * (self.n_components - 1))
+        self.n_axes_max = value_vector([max_p] + [max_z] * (self.n_components - 1))
 
         # gravity is taken into account or not
         grav = 1
         try:
-            scond = get_table_keyword(physics_filename, 'SCOND')[0]     # Read in standard condition setting from file
-            if len(scond) > 2 and fabs(scond[2]) < 1e-5:                # Gravity on or off, default: on
+            scond = get_table_keyword(physics_filename, 'SCOND')[0]  # Read in standard condition setting from file
+            if len(scond) > 2 and fabs(scond[2]) < 1e-5:  # Gravity on or off, default: on
                 grav = 0
         except:
             grav = 1
@@ -48,19 +67,13 @@ class BlackOil:
         # evaluate names of required classes depending on amount of components, self.phases, and selected physics
         # Different engines, accumulation_flux_operator_evaluators and number of operators for gravity on or off
         if grav:
-            engine_name = eval("engine_nc_cg_cpu%d_%d" % (self.n_components, self.n_phases))
+            self.engine = eval("engine_nc_cg_%s%d_%d" % (platform, self.n_vars, self.n_phases))()
             acc_flux_etor_name = black_oil_acc_flux_capillary_evaluator
             self.n_ops = self.n_components + self.n_components * self.n_phases + self.n_phases + self.n_phases
         else:
-            engine_name = eval("engine_nc_cpu%d" % self.n_components)
+            self.engine = eval("engine_nc_%s%d" % (platform, self.n_vars))()
             acc_flux_etor_name = black_oil_acc_flux_evaluator
             self.n_ops = 2 * self.n_components
-
-        acc_flux_itor_name = eval("operator_set_interpolator_i_d_%d_%d" % (self.n_vars, self.n_ops))
-        rate_interpolator_name = eval("operator_set_interpolator_i_d_%d_%d" % (self.n_vars, self.n_phases))
-
-        acc_flux_itor_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_vars, self.n_ops))
-        rate_interpolator_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_vars, self.n_phases))
 
         # read keywords from physics file
         pvto = get_table_keyword(physics_filename, 'PVTO')
@@ -76,11 +89,11 @@ class BlackOil:
         surface_gas_dens = dens[2]
 
         swof_well = []
-        swof_well.append(value_vector([swof[0][0],  swof[0][1],  swof[0][2],  0.0]))
+        swof_well.append(value_vector([swof[0][0], swof[0][1], swof[0][2], 0.0]))
         swof_well.append(value_vector([swof[-1][0], swof[-1][1], swof[-1][2], 0.0]))
 
         sgof_well = []
-        sgof_well.append(value_vector([sgof[0][0],  sgof[0][1],  sgof[0][2], 0.0]))
+        sgof_well.append(value_vector([sgof[0][0], sgof[0][1], sgof[0][2], 0.0]))
         sgof_well.append(value_vector([sgof[-1][0], sgof[-1][1], sgof[-1][2], 0.0]))
 
         # corey_pcow = value_vector([0.5, 0.12, 0.16, 0.2])  ## exponent, phase residual, oil residual, entry pressure
@@ -123,8 +136,8 @@ class BlackOil:
         self.bo_krow_well_ev = table_phase2_relative_permeability_evaluator(self.bo_water_sat_ev, swof_well)
         self.bo_krog_well_ev = table_phase2_relative_permeability_evaluator(self.bo_gas_sat_ev, sgof_well)
         self.bo_kro_well_ev = black_oil_oil_relative_permeability_evaluator(self.bo_water_sat_ev, self.bo_gas_sat_ev,
-                                                                               self.bo_krow_well_ev, self.bo_krog_well_ev,
-                                                                               swof_well, sgof_well)
+                                                                            self.bo_krow_well_ev, self.bo_krog_well_ev,
+                                                                            swof_well, sgof_well)
 
         # create accumulation and flux operators evaluator
         if grav:
@@ -133,64 +146,51 @@ class BlackOil:
             self.bo_pcgo_w_ev = table_phase_capillary_pressure_evaluator(self.bo_gas_sat_ev, sgof_well)
 
             self.acc_flux_etor = acc_flux_etor_name(self.bo_bubble_pres_ev, self.bo_rs_ev, self.bo_xgo_ev,
-                                                self.bo_oil_dens_ev, self.bo_oil_visco_ev, self.bo_oil_sat_ev,
-                                                self.bo_oil_relperm_ev, self.bo_water_dens_ev, self.bo_water_sat_ev,
-                                                self.bo_water_visco_ev, self.bo_water_relperm_ev, self.bo_gas_dens_ev,
-                                                self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
-                                                self.bo_krow_ev, self.bo_krog_ev, self.bo_pcow_ev, self.bo_pcgo_ev,
-                                                self.rock_compaction_ev)
+                                                    self.bo_oil_dens_ev, self.bo_oil_visco_ev, self.bo_oil_sat_ev,
+                                                    self.bo_oil_relperm_ev, self.bo_water_dens_ev, self.bo_water_sat_ev,
+                                                    self.bo_water_visco_ev, self.bo_water_relperm_ev,
+                                                    self.bo_gas_dens_ev,
+                                                    self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
+                                                    self.bo_krow_ev, self.bo_krog_ev, self.bo_pcow_ev, self.bo_pcgo_ev,
+                                                    self.rock_compaction_ev)
             self.acc_flux_w_etor = acc_flux_etor_name(self.bo_bubble_pres_ev, self.bo_rs_ev, self.bo_xgo_ev,
-                                                self.bo_oil_dens_ev, self.bo_oil_visco_ev, self.bo_oil_sat_ev,
-                                                self.bo_oil_relperm_ev, self.bo_water_dens_ev, self.bo_water_sat_ev,
-                                                self.bo_water_visco_ev, self.bo_water_relperm_ev, self.bo_gas_dens_ev,
-                                                self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
-                                                self.bo_krow_ev, self.bo_krog_ev, self.bo_pcow_w_ev, self.bo_pcgo_w_ev,
-                                                self.rock_compaction_ev)
+                                                      self.bo_oil_dens_ev, self.bo_oil_visco_ev, self.bo_oil_sat_ev,
+                                                      self.bo_oil_relperm_ev, self.bo_water_dens_ev,
+                                                      self.bo_water_sat_ev,
+                                                      self.bo_water_visco_ev, self.bo_water_relperm_ev,
+                                                      self.bo_gas_dens_ev,
+                                                      self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
+                                                      self.bo_krow_ev, self.bo_krog_ev, self.bo_pcow_w_ev,
+                                                      self.bo_pcgo_w_ev,
+                                                      self.rock_compaction_ev)
         else:
             self.acc_flux_etor = acc_flux_etor_name(self.bo_bubble_pres_ev, self.bo_rs_ev, self.bo_xgo_ev,
-                                                self.bo_oil_dens_ev, self.bo_oil_visco_ev, self.bo_oil_sat_ev,
-                                                self.bo_oil_relperm_ev, self.bo_water_dens_ev, self.bo_water_sat_ev,
-                                                self.bo_water_visco_ev, self.bo_water_relperm_ev, self.bo_gas_dens_ev,
-                                                self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
-                                                self.bo_krow_ev, self.bo_krog_ev, self.rock_compaction_ev)
+                                                    self.bo_oil_dens_ev, self.bo_oil_visco_ev, self.bo_oil_sat_ev,
+                                                    self.bo_oil_relperm_ev, self.bo_water_dens_ev, self.bo_water_sat_ev,
+                                                    self.bo_water_visco_ev, self.bo_water_relperm_ev,
+                                                    self.bo_gas_dens_ev,
+                                                    self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
+                                                    self.bo_krow_ev, self.bo_krog_ev, self.rock_compaction_ev)
             self.acc_flux_w_etor = acc_flux_etor_name(self.bo_bubble_pres_ev, self.bo_rs_ev, self.bo_xgo_ev,
-                                                self.bo_oil_dens_ev, self.bo_oil_visco_ev, self.bo_oil_sat_ev,
-                                                self.bo_oil_relperm_ev, self.bo_water_dens_ev, self.bo_water_sat_ev,
-                                                self.bo_water_visco_ev, self.bo_water_relperm_ev, self.bo_gas_dens_ev,
-                                                self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
-                                                self.bo_krow_ev, self.bo_krog_ev, self.rock_compaction_ev)
+                                                      self.bo_oil_dens_ev, self.bo_oil_visco_ev, self.bo_oil_sat_ev,
+                                                      self.bo_oil_relperm_ev, self.bo_water_dens_ev,
+                                                      self.bo_water_sat_ev,
+                                                      self.bo_water_visco_ev, self.bo_water_relperm_ev,
+                                                      self.bo_gas_dens_ev,
+                                                      self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
+                                                      self.bo_krow_ev, self.bo_krog_ev, self.rock_compaction_ev)
 
-        # create accumulation and flux operators interpolator
-        # with adaptive uniform parametrization (accuracy is defined by 'n_points')
-        # of compositional space (range is defined by 'min_p', 'max_p', 'min_z')
-        try:
-            # try first to create interpolator with 4-byte index type
-            self.acc_flux_itor = acc_flux_itor_name(self.acc_flux_etor, index_vector([n_points] * self.n_components),
-                                                    value_vector([min_p] + [min_z] * (self.n_components - 1)),
-                                                    value_vector([max_p] + [1 - min_z] * (self.n_components - 1)))
-            self.acc_flux_w_itor = acc_flux_itor_name(self.acc_flux_w_etor, index_vector([n_points] * self.n_components),
-                                                    value_vector([min_p] + [min_z] * (self.n_components - 1)),
-                                                    value_vector([max_p] + [1 - min_z] * (self.n_components - 1)))
-        except RuntimeError:
-            # on exception (assume too small integer range) create interpolator with long index type
-            self.acc_flux_itor = acc_flux_itor_name_long(self.acc_flux_etor,
-                                                         index_vector([n_points] * self.n_components),
-                                                         value_vector([min_p] + [min_z] * (self.n_components - 1)),
-                                                         value_vector([max_p] + [1 - min_z] * (self.n_components - 1)))
-            self.acc_flux_w_itor = acc_flux_itor_name_long(self.acc_flux_w_etor,
-                                                         index_vector([n_points] * self.n_components),
-                                                         value_vector([min_p] + [min_z] * (self.n_components - 1)),
-                                                         value_vector([max_p] + [1 - min_z] * (self.n_components - 1)))
+        # create main interpolator for reservoir (platform should match engine platform)
+        self.acc_flux_itor = self.create_interpolator(self.acc_flux_etor, self.n_vars, self.n_ops, self.n_axes_points,
+                                                      self.n_axes_min, self.n_axes_max, platform=platform,
+                                                      algorithm=itor_type, mode=itor_mode,
+                                                      precision=itor_precision)
 
-        # set up timers
-        self.timer.node["jacobian assembly"] = timer_node()
-        self.timer.node["jacobian assembly"].node["interpolation"] = timer_node()
-        self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"] = timer_node()
-        self.acc_flux_itor.init_timer_node(
-            self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"])
-        self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux w interpolation"] = timer_node()
-        self.acc_flux_w_itor.init_timer_node(
-            self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux w interpolation"])
+        self.acc_flux_w_itor = self.create_interpolator(self.acc_flux_w_etor, self.n_vars, self.n_ops,
+                                                        self.n_axes_points,
+                                                        self.n_axes_min, self.n_axes_max, platform=platform,
+                                                        algorithm=itor_type, mode=itor_mode,
+                                                        precision=itor_precision)
 
         # create rate operators evaluator
         self.rate_etor = black_oil_rate_evaluator(self.bo_bubble_pres_ev, self.bo_rs_ev, self.bo_xgo_ev,
@@ -200,22 +200,16 @@ class BlackOil:
                                                   self.bo_gas_visco_ev, self.bo_gas_relperm_ev, self.bo_xcp_gas_ev,
                                                   self.bo_krow_ev, self.bo_krog_ev)
 
-        try:
-            self.rate_itor = rate_interpolator_name(self.rate_etor, index_vector([n_points] * self.n_components),
-                                                    value_vector([min_p] + [min_z] * (self.n_components - 1)),
-                                                    value_vector([max_p] + [1 - min_z] * (self.n_components - 1)))
-        except RuntimeError:
-            self.rate_itor = rate_interpolator_name_long(self.rate_etor, index_vector([n_points] * self.n_components),
-                                                         value_vector([min_p] + [min_z] * (self.n_components - 1)),
-                                                         value_vector([max_p] + [1 - min_z] * (self.n_components - 1)))
+        # interpolator platform is 'cpu' since rates are always computed on cpu
+        self.rate_itor = self.create_interpolator(self.rate_etor, self.n_vars, self.n_phases, self.n_axes_points,
+                                                  self.n_axes_min, self.n_axes_max, platform='cpu', algorithm=itor_type,
+                                                  mode=itor_mode,
+                                                  precision=itor_precision)
 
         # set up timers
-        self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"] = timer_node()
-        self.rate_itor.init_timer_node(
-            self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"])
-
-        # create engine according to physics selected
-        self.engine = engine_name()
+        self.create_itor_timers(self.acc_flux_itor, 'reservoir interpolation')
+        self.create_itor_timers(self.acc_flux_w_itor, 'well interpolation')
+        self.create_itor_timers(self.rate_itor, 'well controls interpolation')
 
         # create well controls
         # gas stream
@@ -225,17 +219,18 @@ class BlackOil:
 
         self.new_bhp_inj = lambda bhp, inj_stream: bhp_inj_well_control(bhp, value_vector(inj_stream))
         self.new_rate_gas_inj = lambda rate, inj_stream: rate_inj_well_control(self.phases, 0, self.n_components,
-                                                                   self.n_components, rate,
-                                                                   value_vector(inj_stream), self.rate_itor)
+                                                                               self.n_components, rate,
+                                                                               value_vector(inj_stream), self.rate_itor)
 
         self.new_rate_oil_inj = lambda rate, inj_stream: rate_inj_well_control(self.phases, 1, self.n_components,
-                                                                   self.n_components, rate,
-                                                                   value_vector(inj_stream), self.rate_itor)
+                                                                               self.n_components, rate,
+                                                                               value_vector(inj_stream), self.rate_itor)
 
         self.new_rate_water_inj = lambda rate, inj_stream: rate_inj_well_control(self.phases, 2, self.n_components,
-                                                                     self.n_components,
-                                                                     rate,
-                                                                     value_vector(inj_stream), self.rate_itor)
+                                                                                 self.n_components,
+                                                                                 rate,
+                                                                                 value_vector(inj_stream),
+                                                                                 self.rate_itor)
         self.new_bhp_prod = lambda bhp: bhp_prod_well_control(bhp)
         self.new_rate_gas_prod = lambda rate: rate_prod_well_control(self.phases, 0, self.n_components,
                                                                      self.n_components,
@@ -248,9 +243,11 @@ class BlackOil:
                                                                        rate, self.rate_itor)
 
         self.new_acc_flux_itor = lambda new_acc_flux_etor: acc_flux_itor_name(new_acc_flux_etor,
-                                                                              index_vector([n_points, n_points, n_points]),
+                                                                              index_vector(
+                                                                                  [n_points, n_points, n_points]),
                                                                               value_vector([min_p, min_z, min_z]),
-                                                                              value_vector([max_p, 1 - min_z, 1 - min_z]))
+                                                                              value_vector(
+                                                                                  [max_p, 1 - min_z, 1 - min_z]))
 
     def init_wells(self, wells):
         """""

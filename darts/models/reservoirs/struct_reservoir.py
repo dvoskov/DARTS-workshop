@@ -1,3 +1,4 @@
+import os
 from math import pi
 
 import numpy as np
@@ -5,14 +6,13 @@ from darts.engines import conn_mesh, ms_well, ms_well_vector, timer_node, value_
 from darts.mesh.struct_discretizer import StructDiscretizer
 from darts.tools.pyevtk import hl
 from scipy.interpolate import griddata
-import os
 
 
 class StructReservoir:
     def __init__(self, timer, nx: int, ny: int, nz: int,
                  dx, dy, dz,
                  permx, permy, permz,
-                 poro, depth, actnum=1, global_to_local = 0, op_num=0, coord=0, zcorn=0, is_cpg=False):
+                 poro, depth, actnum=1, global_to_local=0, op_num=0, coord=0, zcorn=0, is_cpg=False):
 
         """
         Class constructor method
@@ -59,7 +59,7 @@ class StructReservoir:
                             'op_num': op_num,
                             }
         self.discretizer = StructDiscretizer(nx=nx, ny=ny, nz=nz, dx=dx, dy=dy, dz=dz, permx=permx, permy=permy,
-                                             permz=permz, global_to_local = global_to_local, coord=coord, zcorn=zcorn,
+                                             permz=permz, global_to_local=global_to_local, coord=coord, zcorn=zcorn,
                                              is_cpg=is_cpg)
 
         self.timer.node['initialization'].node['connection list generation'] = timer_node()
@@ -117,7 +117,6 @@ class StructReservoir:
         else:
             # CPG grid from COORD ZCORN
             self.vtk_grid_type = 1
-
 
     def set_boundary_volume(self, xy_minus=-1, xy_plus=-1, yz_minus=-1, yz_plus=-1, xz_minus=-1, xz_plus=-1):
         # get 3d shape
@@ -184,6 +183,10 @@ class StructReservoir:
                 else:
                     well.segment_depth_increment = self.discretizer.len_cell_zdir[i - 1, j - 1, k - 1]
                 well.segment_volume *= well.segment_depth_increment
+            for p in well.perforations:
+                if p[0] == well_block and p[1] == res_block_local:
+                    print('Neglected duplicate perforation for well %s to block [%d, %d, %d]' % (well.name, i, j, k))
+                    return
             well.perforations = well.perforations + [(well_block, res_block_local, well_index)]
             if verbose:
                 print('Added perforation for well %s to block %d [%d, %d, %d] with WI=%f' % (
@@ -193,12 +196,14 @@ class StructReservoir:
                 print('Neglected perforation for well %s to block [%d, %d, %d] (inactive block)' % (well.name, i, j, k))
 
     def init_wells(self):
+        for w in self.wells:
+            assert (len(w.perforations) > 0), "Well %s does not perforate any active reservoir blocks" % w.name
         self.mesh.add_wells(ms_well_vector(self.wells))
         self.mesh.reverse_and_sort()
         self.mesh.init_grav_coef()
 
     def get_cell_cpg_widths(self):
-        assert(self.discretizer.is_cpg == True)
+        assert (self.discretizer.is_cpg == True)
         dx = np.zeros(self.nx * self.ny * self.nz)
         dy = np.zeros(self.nx * self.ny * self.nz)
         dz = np.zeros(self.nx * self.ny * self.nz)
@@ -221,7 +226,8 @@ class StructReservoir:
         if len(self.vtk_filenames_and_times) == 0:
             if self.vtk_grid_type == 0:
                 if (self.n == self.nx) or (self.n == self.ny) or (self.n == self.nz):
-                    self.generate_vtk_grid(compute_depth_by_dz_sum=False) # Add this (if condition) for special 1D vtk export
+                    self.generate_vtk_grid(
+                        compute_depth_by_dz_sum=False)  # Add this (if condition) for special 1D vtk export
                 else:
                     self.generate_vtk_grid()
             else:
@@ -270,7 +276,6 @@ class StructReservoir:
         for fname, t in self.vtk_filenames_and_times.items():
             self.group.addFile(fname, t)
         self.group.save()
-
 
     def generate_vtk_grid(self, strict_vertical_layers=True, compute_depth_by_dz_sum=True):
         # interpolate 2d array using grid (xx, yy) and specified method
@@ -379,8 +384,8 @@ class StructReservoir:
         # DZ=0 can actually be correct values in case of zero-thickness inactive blocks
         # So we don`t need to interpolate them
 
-        #print("Interpolating missing data in DZ...")
-        #interpolate_zeroes_3d(dz_padded)
+        # print("Interpolating missing data in DZ...")
+        # interpolate_zeroes_3d(dz_padded)
 
         if not compute_depth_by_dz_sum:
             print("Interpolating missing data in DEPTH...")
@@ -451,4 +456,4 @@ class StructReservoir:
         self.vtkobj.GRDECL_Data.N = self.n
         self.vtkobj.GRDECL_Data.GRID_type = 'CornerPoint'
         self.vtkobj.GRDECL2VTK(self.global_data['actnum'])
-        #self.vtkobj.decomposeModel()
+        # self.vtkobj.decomposeModel()

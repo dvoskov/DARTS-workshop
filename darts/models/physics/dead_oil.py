@@ -3,9 +3,10 @@ from math import fabs
 from darts.engines import *
 from darts.physics import *
 from darts.tools.keyword_file_tools import *
+from darts.models.physics.physics_base import PhysicsBase
 
 
-class DeadOil:
+class DeadOil(PhysicsBase):
     """"
        Class to generate deadoil physics, including
         Important definitions:
@@ -16,16 +17,30 @@ class DeadOil:
             - property_evaluator
             - well_control (rate, bhp)
     """
-    def __init__(self, timer, physics_filename, n_points, min_p, max_p, min_z, isMP = False, with_gpu = False, static_itor=False):
+
+    def __init__(self, timer, physics_filename, n_points, min_p, max_p, min_z, discr_type='tpfa',
+                 negative_zc_strategy=0, platform='cpu', itor_type='multilinear', itor_mode='adaptive',
+                 itor_precision='d', cache=True):
         """"
-           Initialize DeadOil class.
+           Initialize Compositional class.
            Arguments:
                 - timer: time recording object
                 - physics_filename: filename of the physical properties
+                - components: components names
                 - n_points: number of interpolation points
                 - min_p, max_p: minimum and maximum pressure
                 - min_z: minimum composition
+                - negative_zc_strategy:
+                    0 - do nothing (default behaviour),
+                    1 - normalize the composition,
+                    2 - define x=y=z, gas
+                    3 - define x=y=z, liquid
+                - platform: target simulation platform - 'cpu' (default) or 'gpu'
+                - itor_type: 'multilinear' (default) or 'linear' interpolator type
+                - itor_mode: 'adaptive' (default) or 'static' OBL parametrization
+                - itor_precision: 'd' (default) - double precision or 's' - single precision for interpolation
         """
+        super().__init__(cache)
         self.timer = timer.node["simulation"]
         self.n_points = n_points
         self.min_p = min_p
@@ -38,6 +53,9 @@ class DeadOil:
         self.rate_phases = ['water', 'oil', 'liquid']
         self.vars = ['pressure', 'water composition']
         self.n_phases = len(self.phases)
+        self.n_axes_points = index_vector([n_points] * self.n_vars)
+        self.n_axes_min = value_vector([min_p] + [min_z] * (self.n_components - 1))
+        self.n_axes_max = value_vector([max_p] + [1 - min_z] * (self.n_components - 1))
 
         grav = 1
         try:
@@ -47,33 +65,25 @@ class DeadOil:
         except:
             grav = 1
 
-        if with_gpu:
-            plat = 'gpu'
-            plat_itor = plat
-        else:
-            plat = 'cpu'
-            plat_itor = 'i_d'
-            if static_itor:
-                plat_itor = 'static_i_d'
-
         # evaluate names of required classes depending on amount of components, self.phases, and selected physics
         if grav:
-            engine_name = eval("engine_nc_cg_%s%d_%d" % (plat, self.n_components, self.n_phases))
+            if discr_type == 'mpfa':
+                engine_name = eval("engine_nc_mp_%s%d" % (platform, self.n_components))
+            elif discr_type == 'tpfa':
+                engine_name = eval("engine_nc_cg_%s%d_%d" % (platform, self.n_components, self.n_phases))
+            elif discr_type == 'nltpfa':
+                engine_name = eval("engine_nc_nl_%s%d" % (platform, self.n_components))
             acc_flux_etor_name = dead_oil_acc_flux_capillary_evaluator
             self.n_ops = self.n_components + self.n_components * self.n_phases + self.n_phases + self.n_phases
         else:
-            if isMP:
-                engine_name = eval("engine_nc_mp_%s%d" % (plat, self.n_components))
-            else:
-                engine_name = eval("engine_nc_%s%d" % (plat, self.n_components))
+            if discr_type == 'mpfa':
+                engine_name = eval("engine_nc_mp_%s%d" % (platform, self.n_components))
+            elif discr_type == 'tpfa':
+                engine_name = eval("engine_nc_%s%d" % (platform, self.n_components))
+            elif discr_type == 'nltpfa':
+                engine_name = eval("engine_nc_nl_%s%d" % (platform, self.n_components))
             acc_flux_etor_name = dead_oil_acc_flux_evaluator
             self.n_ops = 2 * self.n_components
-
-        acc_flux_itor_name = eval("operator_set_interpolator_%s_%d_%d" % (plat_itor, self.n_vars, self.n_ops))
-        rate_interpolator_name = eval("operator_set_interpolator_i_d_%d_%d" % (self.n_vars, self.n_phases + 1))
-
-        acc_flux_itor_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_vars, self.n_ops))
-        rate_interpolator_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_vars, self.n_phases + 1))
 
         # read keywords from physics file
         pvdo = get_table_keyword(physics_filename, 'PVDO')
@@ -83,7 +93,7 @@ class DeadOil:
         rock = get_table_keyword(physics_filename, 'ROCK')
 
         swof_well = []
-        swof_well.append(value_vector([swof[0][0],  swof[0][1],  swof[0][2],  0.0]))
+        swof_well.append(value_vector([swof[0][0], swof[0][1], swof[0][2], 0.0]))
         swof_well.append(value_vector([swof[-1][0], swof[-1][1], swof[-1][2], 0.0]))
 
         surface_oil_dens = dens[0]
@@ -100,7 +110,6 @@ class DeadOil:
         self.rock_compaction_evaluator = rock_compaction_evaluator(rock)
         self.do_pcow_ev = table_phase_capillary_pressure_evaluator(self.do_water_sat_ev, swof)
 
-
         # create accumulation and flux operators evaluator
         if grav:
             self.do_pcow_w_ev = table_phase_capillary_pressure_evaluator(self.do_water_sat_ev, swof_well)
@@ -111,74 +120,49 @@ class DeadOil:
                                                     self.do_oil_wat_relperm_ev, self.do_pcow_ev,
                                                     self.rock_compaction_evaluator)
             self.acc_flux_w_etor = acc_flux_etor_name(self.do_oil_dens_ev, self.do_oil_visco_ev,
-                                                    self.do_oil_oil_relperm_ev, self.do_wat_dens_ev,
-                                                    self.do_water_sat_ev, self.do_water_visco_ev,
-                                                    self.do_oil_wat_relperm_ev, self.do_pcow_w_ev,
-                                                    self.rock_compaction_evaluator)
-            try:
-                self.acc_flux_itor = acc_flux_itor_name(self.acc_flux_etor, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_z]), value_vector([max_p, 1 - min_z]))
-                self.acc_flux_w_itor = acc_flux_itor_name(self.acc_flux_w_etor, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_z]), value_vector([max_p, 1 - min_z]))
-            except RuntimeError:
-                self.acc_flux_itor = acc_flux_itor_name_long(self.acc_flux_etor, index_vector([n_points, n_points]),
-                                                        value_vector([min_p, min_z]), value_vector([max_p, 1 - min_z]))
-                self.acc_flux_w_itor = acc_flux_itor_name_long(self.acc_flux_w_etor, index_vector([n_points, n_points]),
-                                                          value_vector([min_p, min_z]),
-                                                          value_vector([max_p, 1 - min_z]))
-            # set up timers
-            self.timer.node["jacobian assembly"] = timer_node()
-            self.timer.node["jacobian assembly"].node["interpolation"] = timer_node()
-            self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"] = timer_node()
-            self.acc_flux_itor.init_timer_node(
-                self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"])
-            self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux w interpolation"] = timer_node()
-            self.acc_flux_w_itor.init_timer_node(
-                self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux w interpolation"])
+                                                      self.do_oil_oil_relperm_ev, self.do_wat_dens_ev,
+                                                      self.do_water_sat_ev, self.do_water_visco_ev,
+                                                      self.do_oil_wat_relperm_ev, self.do_pcow_w_ev,
+                                                      self.rock_compaction_evaluator)
+
         else:
             self.acc_flux_etor = acc_flux_etor_name(self.do_oil_dens_ev, self.do_oil_visco_ev,
                                                     self.do_oil_oil_relperm_ev, self.do_wat_dens_ev,
                                                     self.do_water_sat_ev, self.do_water_visco_ev,
                                                     self.do_oil_wat_relperm_ev, self.rock_compaction_evaluator)
-            try:
-                # try first to create interpolator with 4-byte index type
-                self.acc_flux_itor = acc_flux_itor_name(self.acc_flux_etor, index_vector([n_points, n_points]),
-                                                        value_vector([min_p, min_z]), value_vector([max_p, 1 - min_z]))
-            except RuntimeError:
-                # on exception (assume too small integer range) create interpolator with long index type
-                self.acc_flux_itor = acc_flux_itor_name_long(self.acc_flux_etor, index_vector([n_points, n_points]),
-                                                             value_vector([min_p, min_z]),
-                                                             value_vector([max_p, 1 - min_z]))
+            self.acc_flux_w_etor = acc_flux_etor_name(self.do_oil_dens_ev, self.do_oil_visco_ev,
+                                                    self.do_oil_oil_relperm_ev, self.do_wat_dens_ev,
+                                                    self.do_water_sat_ev, self.do_water_visco_ev,
+                                                    self.do_oil_wat_relperm_ev, self.rock_compaction_evaluator)
 
-            # create accumulation and flux operators interpolator
-            # with adaptive uniform parametrization (accuracy is defined by 'n_points')
-            # of compositional space (range is defined by 'min_p', 'max_p', 'min_z')
-            # set up timers
-            self.timer.node["jacobian assembly"] = timer_node()
-            self.timer.node["jacobian assembly"].node["interpolation"] = timer_node()
-            self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"] = timer_node()
-            self.acc_flux_itor.init_timer_node(
-                self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"])
+        # create main interpolator for reservoir (platform should match engine platform)
+        self.acc_flux_itor = self.create_interpolator(self.acc_flux_etor, self.n_vars, self.n_ops,
+                                                      self.n_axes_points,
+                                                      self.n_axes_min, self.n_axes_max, platform=platform,
+                                                      algorithm=itor_type, mode=itor_mode,
+                                                      precision=itor_precision)
 
+        self.acc_flux_w_itor = self.create_interpolator(self.acc_flux_w_etor, self.n_vars, self.n_ops,
+                                                      self.n_axes_points,
+                                                      self.n_axes_min, self.n_axes_max, platform=platform,
+                                                      algorithm=itor_type, mode=itor_mode,
+                                                      precision=itor_precision)
 
         # create rate operators evaluator
         self.rate_etor = dead_oil_rate_evaluator(self.do_oil_dens_ev, self.do_oil_visco_ev, self.do_oil_oil_relperm_ev,
                                                  self.do_wat_dens_ev, self.do_water_sat_ev, self.do_water_visco_ev,
                                                  self.do_oil_wat_relperm_ev)
 
-        try:
-            # try first to create interpolator with 4-byte index type
-            self.rate_itor = rate_interpolator_name(self.rate_etor, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_z]), value_vector([max_p, 1 - min_z]))
-        except RuntimeError:
-            # on exception (assume too small integer range) create interpolator with long index type
-            self.rate_itor = rate_interpolator_name_long(self.rate_etor, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_z]), value_vector([max_p, 1 - min_z]))
+        # interpolator platform is 'cpu' since rates are always computed on cpu
+        self.rate_itor = self.create_interpolator(self.rate_etor, self.n_vars, self.n_phases + 1, self.n_axes_points,
+                                                  self.n_axes_min, self.n_axes_max, platform='cpu', algorithm=itor_type,
+                                                  mode=itor_mode,
+                                                  precision=itor_precision)
 
         # set up timers
-        self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"] = timer_node()
-        self.rate_itor.init_timer_node(
-            self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"])
+        self.create_itor_timers(self.acc_flux_itor, 'reservoir interpolation')
+        self.create_itor_timers(self.acc_flux_w_itor, 'well interpolation')
+        self.create_itor_timers(self.rate_itor, 'well controls interpolation')
 
         # create engine according to physics selected
         self.engine = engine_name()
@@ -201,11 +185,11 @@ class DeadOil:
                                                                        rate, self.rate_itor)
 
         self.new_rate_oil_prod = lambda rate: rate_prod_well_control(self.rate_phases, 1, self.n_components,
-                                                                       self.n_components,
-                                                                       rate, self.rate_itor)
+                                                                     self.n_components,
+                                                                     rate, self.rate_itor)
         self.new_rate_liq_prod = lambda rate: rate_prod_well_control(self.rate_phases, 2, self.n_components,
-                                                                       self.n_components,
-                                                                       rate, self.rate_itor)															   
+                                                                     self.n_components,
+                                                                     rate, self.rate_itor)
         self.new_acc_flux_itor = lambda new_acc_flux_etor: acc_flux_itor_name(new_acc_flux_etor,
                                                                               index_vector([n_points, n_points]),
                                                                               value_vector([min_p, min_z]),

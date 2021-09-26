@@ -1,10 +1,12 @@
 from darts.engines import *
 from darts.physics import *
-#from darts.models.physics.iapws.custom_rock_property import *
+
+from darts.models.physics.physics_base import PhysicsBase
+# from darts.models.physics.iapws.custom_rock_property import *
 from darts.tools.keyword_file_tools import *
 
 
-class ThermComp:
+class ThermComp(PhysicsBase):
     """"
        Class to generate thermal-compositional physics, including
         Important definitions:
@@ -15,7 +17,9 @@ class ThermComp:
             - property_evaluator
             - well_control (rate, bhp)
     """
-    def __init__(self, timer, physics_filename, components, n_points, min_p, max_p, min_t, max_t, min_z, max_z=1):
+
+    def __init__(self, timer, physics_filename, components, n_points, min_p, max_p, min_t, max_t, min_z, max_z=1,
+                 platform='cpu', itor_type='multilinear', itor_mode='adaptive', itor_precision='d', cache=True):
         """"
            Initialize ThermComp class.
            Arguments:
@@ -27,6 +31,7 @@ class ThermComp:
                 - min_t, max_t: minimum and maximum temperature
                 - min_z, max_z: minimum and maximum composition
         """
+        super().__init__(cache)
         self.timer = timer.node["simulation"]
         self.n_points = n_points
         self.min_p = min_p
@@ -45,22 +50,21 @@ class ThermComp:
         self.vars = ['pressure'] + [c + ' composition' for c in components[:-1]] + ['temperature']
         self.n_phases = len(self.phases)
         self.thermal = 1
+        self.n_axes_points = index_vector([n_points] * self.n_vars)
+        self.n_axes_min = value_vector([min_p] + [min_z] * (self.n_components - 1) + [min_t])
+        self.n_axes_max = value_vector([max_p] + [max_z] * (self.n_components - 1) + [max_t])
+
+        # manual choice whether to use gravity or not
         grav = 0
 
         if grav:
-            engine_name = eval("engine_nct_g_cpu%d_%d" % (self.n_vars, self.n_phases))
+            self.engine = eval("engine_nct_g_cpu%d_%d" % (self.n_vars, self.n_phases))()
             acc_flux_etor_name = therm_comp_acc_flux_grav_evaluator
             self.n_ops = self.n_components + self.n_components * self.n_phases + self.n_phases + self.thermal * 6
         else:
-            engine_name = eval("engine_nct_cpu%d" % self.n_components)
+            self.engine = eval("engine_nct_cpu%d" % self.n_components)()
             acc_flux_etor_name = therm_comp_acc_flux_evaluator
             self.n_ops = 2 * self.n_components + self.thermal * 5
-
-        acc_flux_itor_name = eval("operator_set_interpolator_i_d_%d_%d" % (self.n_vars, self.n_ops))
-        rate_interpolator_name = eval("operator_set_interpolator_i_d_%d_%d" % (self.n_vars, self.n_phases))
-
-        acc_flux_itor_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_vars, self.n_ops))
-        rate_interpolator_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_vars, self.n_phases))
 
         sgof = get_table_keyword(physics_filename, 'SGOF')
         rock = get_table_keyword(physics_filename, 'ROCK')
@@ -72,7 +76,7 @@ class ThermComp:
         pres_sc = scond[0]
         temp_sc = scond[1]
 
-        #self.rock = [value_vector([1, 0, 273.15])]
+        # self.rock = [value_vector([1, 0, 273.15])]
 
         # create property evaluators
         self.gas_sat_ev = property_evaluator_iface()
@@ -86,50 +90,31 @@ class ThermComp:
                                                 self.oil_relperm_ev, self.gas_relperm_ev, self.rock_compaction_ev,
                                                 self.rock_energy_ev)
 
-        try:
-            # try first to create interpolator with 4-byte index type
-            self.acc_flux_itor = acc_flux_itor_name(self.acc_flux_etor, index_vector([n_points] * (self.n_components + 1)),
-                                                    value_vector([min_p] + [min_z] * (self.n_components - 1) + [min_t]),
-                                                    value_vector([max_p] + [max_z] * (self.n_components - 1) + [max_t]))
-        except RuntimeError:
-            # on exception (assume too small integer range) create interpolator with long index type
-            self.acc_flux_itor = acc_flux_itor_name_long(self.acc_flux_etor,
-                                                         index_vector([n_points] * (self.n_components + 1)),
-                                                         value_vector([min_p] + [min_z] * (self.n_components - 1) + [min_t]),
-                                                         value_vector([max_p] + [max_z] * (self.n_components - 1) + [max_t]))
+        # create main interpolator for reservoir (platform should match engine platform)
+        self.acc_flux_itor = self.create_interpolator(self.acc_flux_etor, self.n_vars, self.n_ops,
+                                                      self.n_axes_points, self.n_axes_min, self.n_axes_max,
+                                                      platform=platform, algorithm=itor_type, mode=itor_mode,
+                                                      precision=itor_precision)
 
-        # set up timers
-        self.timer.node["jacobian assembly"] = timer_node()
-        self.timer.node["jacobian assembly"].node["interpolation"] = timer_node()
-        self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"] = timer_node()
-        self.acc_flux_itor.init_timer_node(
-            self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"])
-
+        # create additional evaluator and interpolator for well rates
         self.rate_etor = therm_comp_rate_evaluator(self.n_components, self.n_phases, temp, pres_sc, temp_sc,
-                                                      self.components,
-                                                      self.oil_relperm_ev, self.gas_relperm_ev)
-        try:
-            self.rate_itor = rate_interpolator_name(self.rate_etor, index_vector([n_points] * (self.n_components + 1)),
-                                                         value_vector([min_p] + [min_z] * (self.n_components - 1) + [min_t]),
-                                                         value_vector([max_p] + [max_z] * (self.n_components - 1) + [max_t]))
-        except RuntimeError:
-            self.rate_itor = rate_interpolator_name_long(self.rate_etor, index_vector([n_points] * (self.n_components + 1)),
-                                                         value_vector([min_p] + [min_z] * (self.n_components - 1) + [min_t]),
-                                                         value_vector([max_p] + [max_z] * (self.n_components - 1) + [max_t]))
+                                                   self.components,
+                                                   self.oil_relperm_ev, self.gas_relperm_ev)
+
+        # interpolator platform is 'cpu' since rates are always computed on cpu
+        self.rate_itor = self.create_interpolator(self.rate_etor, self.n_vars, self.n_phases,
+                                                  self.n_axes_points, self.n_axes_min, self.n_axes_max,
+                                                  platform='cpu', algorithm=itor_type, mode=itor_mode,
+                                                  precision=itor_precision)
 
         # set up timers
-        self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"] = timer_node()
-        self.rate_itor.init_timer_node(
-            self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"])
-
-        # create engine according to physics selected
-        self.engine = engine_name()
+        self.create_itor_timers(self.acc_flux_itor, 'reservoir interpolation')
+        self.create_itor_timers(self.rate_itor, 'well controls interpolation')
 
         # define well control factories
-
         self.new_bhp_inj = lambda bhp, inj_stream: bhp_inj_well_control(bhp, value_vector(inj_stream))
         self.new_rate_gas_inj = lambda rate, inj_stream: rate_inj_well_control(self.phases, 0, self.n_vars,
-                                                                     self.n_vars, rate,
+                                                                               self.n_vars, rate,
                                                                                value_vector(inj_stream), self.rate_itor)
         self.new_bhp_prod = lambda bhp: bhp_prod_well_control(bhp)
         self.new_rate_gas_prod = lambda rate: rate_prod_well_control(self.phases, 0, self.n_vars,

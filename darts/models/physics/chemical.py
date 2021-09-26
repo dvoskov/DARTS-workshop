@@ -1,39 +1,70 @@
-import numpy as np
-from darts.engines import *
-from darts.physics import *
-from darts.models.physics.chemical_evaluators import element_acc_flux_etor, element_acc_flux_data, chemical_rate_evaluator
+from darts.models.physics.chemical_evaluators import *
+from darts.models.physics.physics_base import PhysicsBase
 
 
-# Define our own operator evaluator class
-class Chemical:
-    def __init__(self, timer, n_elements, n_points, min_p, max_p, min_e, max_e):
+class Chemical(PhysicsBase):
+    """"
+       Class to generate chemical equilibrium physics, including
+        Important definitions:
+            - accumulation_flux_operator_evaluator
+            - accumulation_flux_operator_interpolator
+            - rate_evaluator
+            - rate_interpolator
+            - property_evaluator
+            - well_control (rate, bhp)
+    """
 
-        # Obtain properties from user input during initialization:
+    def __init__(self, timer, components, n_points, min_p, max_p, min_z, max_z,
+                 platform='cpu', itor_type='multilinear', itor_mode='adaptive', itor_precision='d', cache=True):
+        """"
+           Initialize Chemical class.
+           Arguments:
+                - timer: time recording object
+                - components: list of components in the model (in this case elements)
+                - n_points: number of interpolation points
+                - min_p, max_p: minimum and maximum pressure
+                - min_z, max_z: minimum and maximum composition
+                - platform: target simulation platform - 'cpu' (default) or 'gpu'
+                - itor_type: 'multilinear' (default) or 'linear' interpolator type
+                - itor_mode: 'adaptive' (default) or 'static' OBL parametrization
+                - itor_precision: 'd' (default) - double precision or 's' - single precision for interpolation
+        """
+        super().__init__(cache)
         self.timer = timer.node["simulation"]
+        self.components = components
+        self.n_components = len(components)
+        self.phases = ['gas', 'water']
+        self.n_phases = len(self.phases)
         self.n_points = n_points
         self.min_p = min_p
         self.max_p = max_p
-        self.min_e = min_e
-        self.max_e = max_e
-        self.elements = n_elements
-        self.n_elements = len(n_elements)
-        self.n_vars = self.n_elements
-        self.vars = ['pressure'] + [e + ' composition' for e in n_elements[:-1]]
-        self.phases = ['gas', 'water']
+        self.min_z = min_z
+        self.max_z = max_z
+        self.n_vars = self.n_components
+        self.n_ops = 2 * self.n_components
+        self.vars = ['pressure'] + [e + ' composition' for e in components[:-1]]
         self.n_phases = len(self.phases)
+        self.n_rate_temp_ops = self.n_phases
 
-        bool_trans_upd = True
+        self.n_axes_points = index_vector([n_points] * self.n_vars)
+        self.n_axes_min = value_vector([min_p] + [min_z] * (self.n_components - 1))
+        self.n_axes_max = value_vector([max_p] + [max_z] * (self.n_components - 1))
+
+        # evaluate names of required classes depending on amount of components, self.phases, and selected physics
+        self.engine = eval("engine_nc_%s%d" % (platform, self.n_components))()
 
         # ------------------------------------------------------
         # Start definition parameters physics
         # ------------------------------------------------------
+        bool_trans_upd = True
+
         # Define rate-annihilation matrix E:
         mat_rate_annihilation = np.array([[1, 0, 0, 0, 0],
                                           [0, 1, 0, 0, 0],
                                           [0, 0, 1, 0, 1],
                                           [0, 0, 0, 1, 1]])
 
-        min_comp = min_e * 10
+        min_comp = min_z * 10
         sca_tolerance = np.finfo(float).eps
 
         # Define K-values as function or pressure:
@@ -83,113 +114,84 @@ class Chemical:
         # End definition parameters physics
         # ------------------------------------------------------
 
-        # Name of interpolation method and engine used for this physics:
-        engine_name = eval("engine_nc_cpu%d" % self.n_elements)
-        self.n_ops = 2 * self.n_elements
-        acc_flux_itor_name = eval("operator_set_interpolator_i_d_%d_%d" % (self.n_elements, self.n_ops))
-        rate_interpolator_name = eval("operator_set_interpolator_i_d_%d_%d" % (self.n_elements, self.n_phases))
-
-        acc_flux_itor_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_elements, self.n_ops))
-        rate_interpolator_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_elements, self.n_phases))
-
         # Initialize main evaluator
         self.acc_flux_etor = element_acc_flux_etor(elements_data, bool_trans_upd)
 
-        # Initialize table entries (nr of points, axis min, and axis max):
-        # nr_of_points for [pres, comp1, ..., compN-1]:
-        self.acc_flux_etor.axis_points = index_vector([self.n_points, self.n_points, self.n_points])
-        # axis_min for [pres, comp1, ..., compN-1]:
-        self.acc_flux_etor.axis_min = value_vector([self.min_p, min_e, min_e])
-        # axis_max for [pres, comp1, ..., compN-1]
-        self.acc_flux_etor.axis_max = value_vector([self.max_p, max_e, max_e])
+        self.acc_flux_etor = element_acc_flux_etor(elements_data, bool_trans_upd)
+        self.acc_flux_etor_well = element_acc_flux_etor(elements_data, bool_trans_upd)
 
-        # Create actual accumulation and flux interpolator:
-        try:
-            self.acc_flux_itor = acc_flux_itor_name_long(self.acc_flux_etor, self.acc_flux_etor.axis_points,
-                                                    self.acc_flux_etor.axis_min, self.acc_flux_etor.axis_max)
-        except RuntimeError:
-            self.acc_flux_itor = acc_flux_itor_name_long(self.acc_flux_etor, self.acc_flux_etor.axis_points,
-                                                         self.acc_flux_etor.axis_min, self.acc_flux_etor.axis_max)
+        self.acc_flux_itor = self.create_interpolator(self.acc_flux_etor, self.n_vars, self.n_ops,
+                                                      self.n_axes_points, self.n_axes_min, self.n_axes_max,
+                                                      platform=platform, algorithm=itor_type, mode=itor_mode,
+                                                      precision=itor_precision)
 
-        # set up timers
-        self.timer.node["jacobian assembly"] = timer_node()
-        self.timer.node["jacobian assembly"].node["interpolation"] = timer_node()
-        self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"] = timer_node()
-        self.acc_flux_itor.init_timer_node(
-            self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"])
+        self.acc_flux_itor_well = self.create_interpolator(self.acc_flux_etor_well, self.n_vars, self.n_ops,
+                                                           self.n_axes_points, self.n_axes_min, self.n_axes_max,
+                                                           platform=platform, algorithm=itor_type, mode=itor_mode,
+                                                           precision=itor_precision)
 
-        # Create rate evaluator and interpolator:
+        # create rate operators evaluator
         self.rate_etor = chemical_rate_evaluator(elements_data, bool_trans_upd)
-        try:
-            self.rate_itor = rate_interpolator_name_long(self.rate_etor, self.acc_flux_etor.axis_points,
-                                                    self.acc_flux_etor.axis_min, self.acc_flux_etor.axis_max)
-        except RuntimeError:
-            self.rate_itor = rate_interpolator_name_long(self.rate_etor, self.acc_flux_etor.axis_points,
-                                                         self.acc_flux_etor.axis_min, self.acc_flux_etor.axis_max)
+
+        # interpolator platform is 'cpu' since rates are always computed on cpu
+        self.rate_itor = self.create_interpolator(self.rate_etor, self.n_vars, self.n_rate_temp_ops,
+                                                  self.n_axes_points, self.n_axes_min, self.n_axes_max,
+                                                  platform='cpu', algorithm=itor_type, mode=itor_mode,
+                                                  precision=itor_precision)
 
         # set up timers
-        self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"] = timer_node()
-        self.rate_itor.init_timer_node(
-            self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"])
-
-        # create engine according to physics selected
-        self.engine = engine_name()
+        self.create_itor_timers(self.acc_flux_itor, 'reservoir interpolation')
+        self.create_itor_timers(self.acc_flux_itor_well, 'well interpolation')
+        self.create_itor_timers(self.rate_itor, 'well controls interpolation')
 
         # define well control factories
         # Injection wells (upwind method requires both bhp and inj_stream for bhp controlled injection wells):
+        # (vapor/gas and liquid/aqueous)
         self.new_bhp_inj = lambda bhp, inj_stream: bhp_inj_well_control(bhp, value_vector(inj_stream))
-        self.new_rate_gas_inj = lambda rate, inj_stream: rate_inj_well_control(self.phases, 0, self.n_elements,
-                                                                               self.n_elements, rate,
+        self.new_rate_gas_inj = lambda rate, inj_stream: rate_inj_well_control(self.phases, 0, self.n_components,
+                                                                               self.n_components, rate,
                                                                                value_vector(inj_stream), self.rate_itor)
-        self.new_rate_oil_inj = lambda rate, inj_stream: rate_inj_well_control(self.phases, 1, self.n_elements,
-                                                                               self.n_elements, rate,
+        self.new_rate_oil_inj = lambda rate, inj_stream: rate_inj_well_control(self.phases, 1, self.n_components,
+                                                                               self.n_components, rate,
                                                                                value_vector(inj_stream), self.rate_itor)
-        # Production wells:
+        # Production wells (vapor/gas and liquid/aqueous):
         self.new_bhp_prod = lambda bhp: bhp_prod_well_control(bhp)
-        self.new_rate_gas_prod = lambda rate: rate_prod_well_control(self.phases, 0, self.n_elements,
-                                                                     self.n_elements,
+        self.new_rate_gas_prod = lambda rate: rate_prod_well_control(self.phases, 0, self.n_components,
+                                                                     self.n_components,
                                                                      rate, self.rate_itor)
-        self.new_rate_oil_prod = lambda rate: rate_prod_well_control(self.phases, 1, self.n_elements,
-                                                                     self.n_elements,
+        self.new_rate_oil_prod = lambda rate: rate_prod_well_control(self.phases, 1, self.n_components,
+                                                                     self.n_components,
                                                                      rate, self.rate_itor)
 
-        self.new_acc_flux_itor = lambda new_acc_flux_etor: \
-            acc_flux_itor_name(new_acc_flux_etor, self.acc_flux_etor.axis_points,
-                               self.acc_flux_etor.axis_min, self.acc_flux_etor.axis_max)
-
-    # Define some class methods:
     def init_wells(self, wells):
+        """""
+        Function to initialize the well rates for each well
+        Arguments:
+            -wells: well_object array
+        """
         for w in wells:
             assert isinstance(w, ms_well)
-            w.init_rate_parameters(self.n_elements, self.phases, self.rate_itor)
+            # w.init_rate_parameters(self.n_components + 1, self.phases, self.rate_itor)
+            w.init_rate_parameters(self.n_components, self.phases, self.rate_itor)
 
-    def set_uniform_initial_conditions(self, mesh, uniform_pressure, uniform_composition: list):
-
+    def set_uniform_initial_conditions(self, mesh, uniform_pressure, uniform_composition):
+        """""
+        Function to set uniform initial reservoir condition
+        Arguments:
+            -mesh: mesh object
+            -uniform_pressure: uniform pressure setting
+            -uniform_temperature: uniform composition setting
+        """
         assert isinstance(mesh, conn_mesh)
-        assert len(uniform_composition) == self.n_elements - 1
-
+        assert len(uniform_composition) == self.n_components - 1
         nb = mesh.n_blocks
 
-        # set inital pressure
+        # set initial pressure
         pressure = np.array(mesh.pressure, copy=False)
         pressure.fill(uniform_pressure)
 
         # set initial composition
-        mesh.composition.resize(nb * (self.n_elements - 1))
+        mesh.composition.resize(nb * (self.n_components - 1))
         composition = np.array(mesh.composition, copy=False)
-        for c in range(self.n_elements - 1):
-            composition[c::(self.n_elements - 1)] = uniform_composition[c]
-
-    def set_boundary_conditions(self, mesh, pressure_bc, composition_bc, boundary_cells):
-        assert isinstance(mesh, conn_mesh)
-        assert len(composition_bc) == self.n_elements - 1
-
-        # Class methods which can create constant pressure and composition boundary condition:
-        pressure = np.array(mesh.pressure, copy=False)
-        pressure[boundary_cells] = pressure_bc
-
-        mesh.composition.resize(mesh.n_blocks * (self.n_elements - 1))
-        composition = np.array(mesh.composition, copy=False)
-
-        for c in range(self.n_elements - 1):
-            composition[boundary_cells * 2 + c] = composition_bc[c]
+        for c in range(self.n_components - 1):
+            composition[c::(self.n_components - 1)] = uniform_composition[c]

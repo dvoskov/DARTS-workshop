@@ -5,6 +5,7 @@ import time
 from itertools import combinations, compress
 import meshio
 import numpy as np
+from scipy.linalg import null_space
 from .geometrymodule import Hexahedron, Wedge, Tetrahedron, Pyramid, Quadrangle, Triangle, Face, FType
 from .transcalc import TransCalculations
 import copy
@@ -55,15 +56,19 @@ class UnstructDiscretizer:
         self.mat_cell_info_dict = {}  # Dictionary containing information of all the matrix cells
         self.frac_cell_info_dict = {}  # Dictionary containing information of all the fracture cells
         self.bound_cell_info_dict = {}  # Dictionary containing information of all the boundary cells
+        self.output_face_info_dict = {} # Dictionary containing information of all the faces for output
         self.mat_cells_to_node = {}  # Dictionary containing all the cells belonging to each matrix node
         self.frac_cells_to_node = {}  # Dictionary containing all the cells belonging to each fracture node
         self.bound_cells_to_node = {}  # Dictionary containing all the cells belonging to each fracture node
         self.geometries_in_mesh_file = []  # List with geometries found in mesh file
+        self.frac_geometries_in_file = []  # List with fracture geometries found in mesh file
         self.matrix_cell_count = 0  # Number of matrix cells found when calc. matrix cell information
         self.fracture_cell_count = 0  # Number of fracture cells found when calc. fracture cell information
         self.bound_cell_count = 0  # Number of boundary cells
+        self.output_face_count = 0 # Number of faces for output
         self.mat_cells_tot = num_matrix_cells  # Total number of matrix cells
         self.frac_cells_tot = num_fracture_cells  # Total number of fracture cells
+        self.output_face_tot = 0  # Number of output faces
         self.volume_all_cells = {}  # Volume of matrix and fracture cells (later as numpy.array)
         self.depth_all_cells = {}  # Depth of matrix and fracture cells (later as numpy.array)
         self.centroid_all_cells = {}  # Centroid of matrix and fracture cells (later as numpy.array)
@@ -105,8 +110,7 @@ class UnstructDiscretizer:
         self.fracture_aperture = self.check_fracture_data_input(frac_aper, 'frac_aper')
         self.perm_frac_cell = (self.fracture_aperture ** 2) / 12 * 1E15
 
-    def init_matrix_stiffness(self, props, num_matrix_cells = 0):
-        self.mat_cells_tot = num_matrix_cells
+    def init_matrix_stiffness(self, props):
         self.stiffness = {}
         self.stf = {}
         self.E = {}
@@ -176,15 +180,18 @@ class UnstructDiscretizer:
             self.mesh_data = meshio.read(self.mesh_file)
 
             # Store all available geometries of the objects found by meshio in a list:
-            for ith_geometry in self.mesh_data.cells:
+            for ith_geometry in self.mesh_data.cells_dict:
                 self.geometries_in_mesh_file.append(ith_geometry)
+
+                if ith_geometry in self.available_fracture_geometries:
+                    self.frac_geometries_in_file.append(ith_geometry)
 
             # Create default dictionary entry:
             for geometry in self.available_matrix_geometries:
-                self.mesh_data.cells.setdefault(geometry, np.array([]))
+                self.mesh_data.cells_dict.setdefault(geometry, np.array([]))
 
             for geometry in self.available_fracture_geometries:
-                self.mesh_data.cells.setdefault(geometry, np.array([]))
+                self.mesh_data.cells_dict.setdefault(geometry, np.array([]))
 
             print('Time to load Mesh: {:f} [sec]'.format((time.time() - start_time_module)))
             print(self.mesh_data)
@@ -197,16 +204,16 @@ class UnstructDiscretizer:
             if self.frac_cells_tot == 0:
                 count_frac_cells = True
 
-            for ith_geometry in self.mesh_data.cells:
+            for ith_geometry in self.mesh_data.cells_dict:
                 # Find and store number of cells:
                 if ith_geometry in self.available_fracture_geometries:
                     # Geometry indicates (supported) fracture type geometry (2D element):
                     if count_frac_cells:
-                        self.frac_cells_tot += self.mesh_data.cells[ith_geometry].shape[0]
+                        self.frac_cells_tot += self.mesh_data.cells_dict[ith_geometry].shape[0]
                 elif ith_geometry in self.available_matrix_geometries:
                     # Geometry indicates (supported) matrix type geometry (3D element):
                     if count_mat_cells:
-                        self.mat_cells_tot += self.mesh_data.cells[ith_geometry].shape[0]
+                        self.mat_cells_tot += self.mesh_data.cells_dict[ith_geometry].shape[0]
                 else:
                     # Found geometry which is not supported by discretizer!
                     print('!!!!!!!!!!!!UNSUPORTED GEOMETRY FOUND!!!!!!!!!!!!')
@@ -239,8 +246,9 @@ class UnstructDiscretizer:
 
         # Count all the cells, boundary cells and fractures by their types
         self.mat_cells_tot = self.bound_cells_tot = self.frac_cells_tot = 0
-        for geometry, types in self.mesh_data.cell_data.items():
-            unique, counts = np.unique(types['gmsh:physical'], return_counts=True)
+        for geometry, all_types in self.mesh_data.cell_data.items():
+            types = all_types['gmsh:physical']
+            unique, counts = np.unique(types, return_counts=True)
             for type, count in zip(unique, counts):
                 if type in self.physical_tags['boundary']:
                     self.bound_cells_tot += count
@@ -248,6 +256,8 @@ class UnstructDiscretizer:
                     self.mat_cells_tot += count
                 elif type in self.physical_tags['fracture']:
                     self.frac_cells_tot += count
+                elif type in self.physical_tags['output']:
+                    self.output_face_tot += count
                 else:
                     # Found geometry which is not supported by discretizer!
                     print('!!!!!!!!!!!!UNSUPORTED GEOMETRY FOUND!!!!!!!!!!!!')
@@ -262,15 +272,17 @@ class UnstructDiscretizer:
         face_count = 0
         bound_count = 0
         global_count = 0
+        output_count = 0
 
-        for geometry, tags in sorted(list(self.mesh_data.cell_data.items()), key=lambda x: -x[1]['gmsh:physical'][0]):
+        for geometry, types in sorted(list(self.mesh_data.cell_data.items()), key=lambda x: -x[1]['gmsh:physical'][0]):
+            tags = types['gmsh:physical']
             # Main loop over different existing geometries
             for ith_cell, nodes_to_cell in enumerate(self.mesh_data.cells[geometry]):
                 global_count += 1
 
                 # Calculate general information for cell, based on geometry, nodes belong to cell and their coordinates:
                 # matrix cells
-                if tags['gmsh:physical'][ith_cell] in self.physical_tags['matrix']:
+                if tags[ith_cell] in self.physical_tags['matrix']:
                     for key in nodes_to_cell:
                         self.mat_cells_to_node.setdefault(key, [])
                         self.mat_cells_to_node[key].append(cell_count)
@@ -281,30 +293,30 @@ class UnstructDiscretizer:
                                        np.array([self.perm_x_cell[mat_count],
                                                  self.perm_y_cell[mat_count],
                                                  self.perm_z_cell[mat_count]]),
-                                       tags['gmsh:physical'][ith_cell])
+                                       tags[ith_cell])
                     elif geometry == 'wedge':
                         self.mat_cell_info_dict[cell_count] = \
                             Wedge(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry,
                                   np.array([self.perm_x_cell[mat_count],
                                             self.perm_y_cell[mat_count],
-                                            self.perm_z_cell[mat_count]]), tags['gmsh:physical'][ith_cell])
+                                            self.perm_z_cell[mat_count]]), tags[ith_cell])
                     elif geometry == 'tetra':
                         self.mat_cell_info_dict[cell_count] = \
                             Tetrahedron(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry,
                                         np.array([self.perm_x_cell[mat_count],
                                                   self.perm_y_cell[mat_count],
                                                   self.perm_z_cell[mat_count]]),
-                                        tags['gmsh:physical'][ith_cell])
+                                        tags[ith_cell])
                     elif geometry == 'pyramid':
                         self.mat_cell_info_dict[cell_count] = \
                             Pyramid(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry,
                                     np.array([self.perm_x_cell[mat_count],
                                               self.perm_y_cell[mat_count],
-                                              self.perm_z_cell[mat_count]]), tags['gmsh:physical'][ith_cell])
+                                              self.perm_z_cell[mat_count]]), tags[ith_cell])
                     cell_count += 1
                     mat_count += 1
                 # boundary cells
-                elif tags['gmsh:physical'][ith_cell] in self.physical_tags['boundary']:
+                elif tags[ith_cell] in self.physical_tags['boundary']:
                     for key in nodes_to_cell:
                         self.bound_cells_to_node.setdefault(key, [])
                         self.bound_cells_to_node[key].append(face_count)
@@ -312,32 +324,42 @@ class UnstructDiscretizer:
                     if geometry == 'quad':
                         self.bound_cell_info_dict[face_count] = \
                             Quadrangle(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry, 0.0,
-                                       tags['gmsh:physical'][ith_cell])
-                        self.boundary_conditions[tags['gmsh:physical'][ith_cell]]['cells'].append(face_count)
+                                       tags[ith_cell])
+                        self.boundary_conditions[tags[ith_cell]]['cells'].append(face_count)
                     elif geometry == 'triangle':
                         self.bound_cell_info_dict[face_count] = \
                             Triangle(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry, 0.0,
-                                     tags['gmsh:physical'][ith_cell])
-                        self.boundary_conditions[tags['gmsh:physical'][ith_cell]]['cells'].append(face_count)
+                                     tags[ith_cell])
+                        self.boundary_conditions[tags[ith_cell]]['cells'].append(face_count)
                     face_count += 1
                     bound_count += 1
                 # fracture cells
-                elif tags['gmsh:physical'][ith_cell] in self.physical_tags['fracture']:
+                elif tags[ith_cell] in self.physical_tags['fracture']:
                     for key in nodes_to_cell:
                         self.frac_cells_to_node.setdefault(key, [])
                         self.frac_cells_to_node[key].append(cell_count)
 
                     if geometry == 'quad':
                         self.frac_cell_info_dict[cell_count] = \
-                            Quadrangle(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry, 0.0, tags['gmsh:physical'][ith_cell])
+                            Quadrangle(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry, 0.0, tags[ith_cell])
                     elif geometry == 'triangle':
                         self.frac_cell_info_dict[cell_count] = \
-                            Triangle(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry, 0.0, tags['gmsh:physical'][ith_cell])
+                            Triangle(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry, 0.0, tags[ith_cell])
                     cell_count += 1
+                # output faces
+                elif tags[ith_cell] in self.physical_tags['output']:
+                    if geometry == 'quad':
+                        self.output_face_info_dict[output_count] = \
+                            Quadrangle(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry, 0.0, tags[ith_cell])
+                    elif geometry == 'triangle':
+                        self.output_face_info_dict[output_count] = \
+                            Triangle(nodes_to_cell, self.mesh_data.points[nodes_to_cell, :], geometry, 0.0, tags[ith_cell])
+                    output_count += 1
 
         self.matrix_cell_count = mat_count
         self.bound_cell_count = bound_count
         self.fracture_cell_count = cell_count - mat_count
+        self.output_face_count = output_count
 
         print('Time to load Mesh: {:f} [sec]'.format((time.time() - start_time_module)))
         print(self.mesh_data)
@@ -358,39 +380,39 @@ class UnstructDiscretizer:
         # Temporarily store mesh_data in copy:
         Mesh = meshio.read(self.mesh_file)
 
-        # Allocate empty new cell_data dictionary:
-        cell_data = {}
+        # Allocate empty new cell_data_dict dictionary:
+        cell_data_dict = dict()
 
-        # Init left and right slice bounds:
+        for ith_prop in range(len(cell_property)):
+            cell_data_dict[cell_property[ith_prop]] = []
+            left_bound = 0
+            right_bound = 0
+            for ith_geometry in self.mesh_data.cells_dict:
+                left_bound = right_bound
+                right_bound = right_bound + self.mesh_data.cells_dict[ith_geometry].shape[0]
+                cell_data_dict[cell_property[ith_prop]].append(list(property_array[left_bound:right_bound, ith_prop]))
+
+        cell_data_dict['matrix_cell_bool'] = []
         left_bound = 0
         right_bound = 0
-
-        for ith_geometry in self.mesh_data.cells:
-            # Extract left and right bound of array slicing:
+        for ith_geometry in self.mesh_data.cells_dict:
             left_bound = right_bound
-            right_bound = right_bound + self.mesh_data.cells[ith_geometry].shape[0]
+            right_bound = right_bound + self.mesh_data.cells_dict[ith_geometry].shape[0]
 
-            # Store matrix or fractures cells in appropriate location
             if (ith_geometry in self.available_fracture_geometries) and (right_bound - left_bound) > 0:
-                # Geometry indicates (supported) fracture type geometry (2D element):
-                cell_data[ith_geometry] = {}
-                for ith_prop in range(len(cell_property)):
-                    cell_data[ith_geometry][cell_property[ith_prop]] = property_array[left_bound:right_bound, ith_prop]
-
-                cell_data[ith_geometry]['matrix_cell_bool'] = np.zeros(((right_bound - left_bound),))
+                cell_data_dict['matrix_cell_bool'].append(list(np.zeros(((right_bound - left_bound),))))
 
             elif (ith_geometry in self.available_matrix_geometries) and (right_bound - left_bound) > 0:
-                # Add matrix data to dictionary:
-                cell_data[ith_geometry] = {}
-                for ith_prop in range(len(cell_property)):
-                    cell_data[ith_geometry][cell_property[ith_prop]] = property_array[left_bound:right_bound, ith_prop]
+                cell_data_dict['matrix_cell_bool'].append(list(np.ones(((right_bound - left_bound),))))
 
-                cell_data[ith_geometry]['matrix_cell_bool'] = np.ones(((right_bound - left_bound),))
+        mesh = meshio.Mesh(
+            Mesh.points,
+            Mesh.cells,
+            # Each item in cell data must match the cells array
+            cell_data=cell_data_dict)
 
-        # Store solution for each time-step:
-        Mesh.cell_data = cell_data
         print('Writing data to VTK file for {:d}-th reporting step'.format(ith_step))
-        meshio.write("{:s}/solution{:d}.vtk".format(output_directory, ith_step), Mesh)
+        meshio.write("{:s}/solution{:d}.vtk".format(output_directory, ith_step), mesh)
         return 0
 
     def calc_cell_information(self, cache=0):
@@ -425,7 +447,7 @@ class UnstructDiscretizer:
 
             for geometry in self.geometries_in_mesh_file:
                 # Main loop over different existing geometries
-                for ith_cell, nodes_to_cell in enumerate(self.mesh_data.cells[geometry]):
+                for ith_cell, nodes_to_cell in enumerate(self.mesh_data.cells_dict[geometry]):
                     global_count += 1
 
                     # Calculate general information for cell, based on geometry, nodes belong to cell and their coordinates:
@@ -437,7 +459,7 @@ class UnstructDiscretizer:
                             self.mat_cells_to_node.setdefault(key, [])
                             self.mat_cells_to_node[key].append(actual_mat_cell_id)
 
-                        if ith_cell == (len(self.mesh_data.cells[geometry]) - 1):
+                        if ith_cell == (len(self.mesh_data.cells_dict[geometry]) - 1):
                             self.matrix_cell_count = self.matrix_cell_count + ith_cell + 1
 
                     elif geometry in self.available_fracture_geometries:
@@ -448,7 +470,7 @@ class UnstructDiscretizer:
                             self.frac_cells_to_node.setdefault(key, [])
                             self.frac_cells_to_node[key].append(actual_frac_cell_id)
 
-                        if ith_cell == (len(self.mesh_data.cells[geometry]) - 1):
+                        if ith_cell == (len(self.mesh_data.cells_dict[geometry]) - 1):
                             self.fracture_cell_count = self.fracture_cell_count + ith_cell + 1
 
                     # Construct control volume object depending on geometry (class):
@@ -732,7 +754,7 @@ class UnstructDiscretizer:
             if geometry in self.available_matrix_geometries:
                 # Matrix geometry found, check if any matrix control volume has exactly 4 or 3 nodes which intersect
                 # with the boundary_points list:
-                for ith_cell, ith_row in enumerate(self.mesh_data.cells[geometry]):
+                for ith_cell, ith_row in enumerate(self.mesh_data.cells_dict[geometry]):
                     if len(set.intersection(set(ith_row), set(boundary_points))) == 4 or \
                             len(set.intersection(set(ith_row), set(boundary_points))) == 3:
                         # Store cell since it is on the left boundary:
@@ -794,7 +816,7 @@ class UnstructDiscretizer:
                 # Matrix geometry found, check if any matrix control volume has exactly 4 nodes which intersect with
                 # the left_boundary_points list:
                 for ith_cell, ith_row in enumerate(
-                        self.mesh_data.cells[geometry]):
+                        self.mesh_data.cells_dict[geometry]):
 
                     if len(set.intersection(set(ith_row), set(left_boundary_points))) == 4 or \
                             len(set.intersection(set(ith_row), set(
@@ -809,7 +831,7 @@ class UnstructDiscretizer:
                 # Matrix geometry found, check if any matrix control volume has exactly 4 nodes which intersect with
                 # the right_boundary_points list:
                 for ith_cell, ith_row in enumerate(
-                        self.mesh_data.cells[geometry]):
+                        self.mesh_data.cells_dict[geometry]):
                     if len(set.intersection(set(ith_row), set(right_boundary_points))) == 4 or \
                             len(set.intersection(set(ith_row), set(
                                 right_boundary_points))) == 3:  # Store cell since it is on the left boundary:
@@ -982,37 +1004,22 @@ class UnstructDiscretizer:
                             # Check if there exists a fracture on the currently investigated
                             # interface:
                             try:
-                                if any(np.equal(np.sort(self.mesh_data.cells['triangle'], axis=1),
-                                                np.sort(nodes_to_face)).all(1)):
-                                    '''
-                                    I am sorting here because I checking the nodes of the face belonging to the cell,
-                                    which can be in any order, versus the nodes belonging to all the fracture cell
-                                    geometries. If any match exists, then there must be a fracture on the face.
-                                    '''
-                                    face_has_fracture = True
+                                for geometry in self.frac_geometries_in_file:
+                                    # todo: this is most likely the reason why models with a lot of fractures are
+                                    #  extremely slow, check after holiday if this can be done in another way!!!
+                                    if any(np.equal(np.sort(self.mesh_data.cells_dict[geometry], axis=1),
+                                                    np.sort(nodes_to_face)).all(1)):
+                                        '''
+                                        I am sorting here because I checking the nodes of the face belonging to the cell,
+                                        which can be in any order, versus the nodes belonging to all the fracture cell
+                                        geometries. If any match exists, then there must be a fracture on the face.
+                                        '''
+                                        face_has_fracture = True
 
-                                    # Find intersection fracture (fracture element number):
-                                    frac_element_nr = list(
-                                        self.mat_cell_info_dict[ith_cell].find_intersections(self.frac_cells_to_node,
-                                                                                             nodes_to_face))
-
-                            except ValueError:
-                                pass
-
-                            try:
-                                if any(np.equal(np.sort(self.mesh_data.cells['quad'], axis=1),
-                                                np.sort(nodes_to_face)).all(1)):
-                                    '''
-                                    I am sorting here because I checking the nodes of the face belonging to the cell,
-                                    which can be in any order, versus the nodes belonging to all the fracture cell
-                                    geometries. If any match exists, then there must be a fracture on the face.
-                                    '''
-                                    face_has_fracture = True
-
-                                    # Find intersection fracture (fracture element number):
-                                    frac_element_nr = list(
-                                        self.mat_cell_info_dict[ith_cell].find_intersections(self.frac_cells_to_node,
-                                                                                             nodes_to_face))
+                                        # Find intersection fracture (fracture element number):
+                                        frac_element_nr = list(
+                                            self.mat_cell_info_dict[ith_cell].find_intersections(self.frac_cells_to_node,
+                                                                                                 nodes_to_face))
 
                             except ValueError:
                                 pass
@@ -1120,7 +1127,10 @@ class UnstructDiscretizer:
 
     # Multi-Point Flux Approximation (MPFA)
     def calc_cell_neighbours(self):
+        output_faces = {frozenset(face.nodes_to_cell): face_id for face_id, face in self.output_face_info_dict.items()}
+
         self.faces = {}
+        self.output_face_to_face = {}
         # matrix-matrix & matrix-boundary connections
         for node_num, cells_num in self.mat_cells_to_node.items():
             # All the cells' faces belonging to the interaction region
@@ -1133,12 +1143,18 @@ class UnstructDiscretizer:
                     for id1, pts1 in cell_faces.items():
                         if id != id1 and np.all(np.in1d(pts, pts1)):
                             self.faces[id[0]][id[1]] = Face(id[0],id[1],id1[0],id1[1],self.mesh_data.points[pts],0,FType.MAT)
+                            frozenpts = frozenset(pts)
+                            if frozenpts in output_faces:
+                                self.output_face_to_face[output_faces[frozenpts]] = (id[0], id[1])
                             if id1[0] not in self.faces: self.faces[id1[0]] = {}
                             self.faces[id1[0]][id1[1]] = Face(id1[0],id1[1],id[0],id[1],self.mesh_data.points[pts],0,FType.MAT)
                     if id[1] not in self.faces[id[0]]:
                         b_cells = [self.bound_cells_to_node[pt] for pt in pts]
                         b_id = next(iter(set(b_cells[0]).intersection(*b_cells)))
                         self.faces[id[0]][id[1]] = Face(id[0],id[1],id[0],b_id,self.mesh_data.points[pts],0,FType.BORDER)
+                        frozenpts = frozenset(pts)
+                        if frozenpts in output_faces:
+                            self.output_face_to_face[output_faces[frozenpts]] = (id[0], id[1])
 
         fap = self.fracture_aperture
         # fracture-fracture connections
@@ -1173,6 +1189,9 @@ class UnstructDiscretizer:
                                                                   0, FType.MAT_TO_FRAC)
                     self.faces[frac_id][counter] = Face(frac_id, counter, id[0], id[1], self.mesh_data.points[pts],
                                                                   0, FType.FRAC_TO_MAT)
+                    t_face = cur_mat[len(cur_mat)-1].centroid - self.mat_cell_info_dict[id[0]].centroid
+                    cur_mat[len(cur_mat) - 1].n *= 1.0 if cur_mat[len(cur_mat) - 1].n.dot(t_face) < 0 else -1.0
+                    self.faces[frac_id][counter].n *= 1.0 if self.faces[frac_id][counter].n.dot(t_face) < 0 else -1.0
                     counter += 1
     def add_subinterface(self, src, src_cells):
         idx1 = np.abs(src) > self.tol
@@ -1297,15 +1316,8 @@ class UnstructDiscretizer:
                     n = (np.cross(edges[0], edges[1]) + np.cross(edges[1], edges[2])) / 2
                     dir = face_centers[id_faces[k]] - self.mat_cell_info_dict[faces[id_faces[k]][0][0]].centroid
                     if np.inner(dir, n) < 0: n = -n
-
-                    p = cells[id_cell].permeability
-                    p = np.diag(cells[id_cell].permeability)
-                    from scipy.spatial.transform import Rotation as R
-                    r = R.from_rotvec([-np.pi / 3, -np.pi / 4, -np.pi / 6])
-                    new_perm = r.as_dcm().dot(p).dot(r.as_dcm().T)
-                    #new_perm = np.array([[p[0], p[0]/3, p[0]/3], [p[0]/3, p[1], p[0]/3], [p[0]/3, p[0]/3, p[2]]])
                     # One side of flux continuity over id_faces[k] sub-interface
-                    omega = -nu.dot(n.dot(new_perm)) / vol
+                    omega = -nu.dot(n.dot(self.permeability[id_cell])) / vol
                     if np.count_nonzero(C[id_faces[k]]) == 0:
                         C[id_faces[k], id_faces] -= TransCalculations.darcy_constant * omega
                         D[id_faces[k], i] -= TransCalculations.darcy_constant * np.sum(omega)
@@ -1356,7 +1368,7 @@ class UnstructDiscretizer:
                         cur_stencil[bc_counter] = self.mat_cells_tot + b_id
                         bc_counter += 1
             # Transmissibility of sub-interface
-            T = C.dot(np.linalg.inv(A)).dot(B) - D
+            T = D - C.dot(np.linalg.inv(A)).dot(B)
             # Check if the sum of transmissibilities is not equal to zero
             sum_trans = np.abs(np.sum(T[:,inds_to_check], axis=1))
             assert (sum_trans < self.tol).all()
@@ -1460,50 +1472,72 @@ class UnstructDiscretizer:
                                                                      np.concatenate((gT[5], g[1], g[3])),
                                                                      np.concatenate((gT[4], gT[3], g[2]))])
     def check_if_neumann_boundary(self, cell_id, face_id):
-        nebr = self.faces[cell_id][face_id].cell_id2
-        if nebr[0] == cell_id:
-            # a == 0.0
-            return self.bc_mech[self.bcm_num * nebr[1]] == 0.0
-        else:
-            return False
+        face = self.faces[cell_id][face_id]
+        if face.type == FType.BORDER:
+            bc_data = self.bc_mech[self.bcm_num * face.face_id2:self.bcm_num * (face.face_id2 + 1)]
+            if bc_data[2] == self.P12:
+                return bc_data[0] == 0.0
+        return False
+    def check_if_roller_boundary(self, cell_id, face_id):
+        face = self.faces[cell_id][face_id]
+        if face.type == FType.BORDER:
+            bc_data = self.bc_mech[self.bcm_num * face.face_id2:self.bcm_num * (face.face_id2 + 1)]
+            return bc_data[2] == self.Prol
+        return False
     def check_if_boundary(self, cell_id, face_id):
         nebr = self.faces[cell_id][face_id].cell_id2
         return nebr == cell_id
     def get_not_coplanar_stencil(self, cell_id, face_id):
         cell = self.mat_cell_info_dict[cell_id]
-        face = self.faces[cell_id][face_id]
+        faces = self.faces[cell_id]
+        face = faces[face_id]
+        # Check if is_on_fault
+        is_on_fault = False
+        fault_conn_id = -1
+        for j, f in faces.items():
+            if f.type == FType.MAT_TO_FRAC:
+                is_on_fault = True
+                fault_conn_id = j
+                break
+        #j0 = np.argwhere(cur_conns == faces[fault_conn_id].face_id1)[0][0]
+        #face0 = self.faces[cell_id][cur_conns[j0]]
+
         t_face = face.centroid - cell.centroid
         # Determine first face
         face_id1 = (face_id - 1) % len(cell.nodes_to_faces)
         while face_id1 != face_id:
-            face1 = self.faces[cell_id][face_id1]
+            face1 = faces[face_id1]
             t_face1 = face1.centroid - cell.centroid
-            S = np.abs(np.linalg.norm(np.cross(t_face, t_face1)))
-            Scmp = (np.pi / 180) * min(np.linalg.norm(t_face),np.linalg.norm(t_face1))
+            S = np.linalg.norm(np.cross(t_face, t_face1))
+            Scmp = (np.pi / 180) * min(np.linalg.norm(t_face),np.linalg.norm(t_face1)) ** 2
             # Check non-collinearity & if it is not a Neumann boundary
-            if S > Scmp and S > self.tol and not self.check_if_boundary(cell_id, face_id1):
+            if S > Scmp and S > self.tol and face1.type != FType.MAT_TO_FRAC and not self.check_if_roller_boundary(cell_id, face_id1):
                 break
             face_id1 = (face_id1 - 1) % len(cell.nodes_to_faces)
         # Determine second face
         face_id2 = (face_id + 1) % len(cell.nodes_to_faces)
         while face_id2 != face_id1:
-            face2 = self.faces[cell_id][face_id2]
+            face2 = faces[face_id2]
             t_face2 = face2.centroid - cell.centroid
             V = np.abs(np.linalg.det(np.array([t_face, t_face1, t_face2])))
-            Vcmp = (np.pi / 180) ** 2 * min(np.linalg.norm(t_face),np.linalg.norm(t_face1),np.linalg.norm(t_face2))
+            Vcmp = (np.pi / 180) ** 2 * min(np.linalg.norm(t_face),np.linalg.norm(t_face1),np.linalg.norm(t_face2)) ** 3
             # Check non-complanarity & if it is not a Neumann boundary
-            if V > Vcmp and V > self.tol and not self.check_if_boundary(cell_id, face_id2):
+            if V > Vcmp and V > self.tol and face1.type != FType.MAT_TO_FRAC and not self.check_if_roller_boundary(cell_id, face_id2):
                 break
             face_id2 = (face_id2 + 1) % len(cell.nodes_to_faces)
         assert (face_id1 != face_id2)
         assert (face_id1 != face_id)
         assert (face_id2 != face_id)
-        return [face_id1, face_id, face_id2]
+
+        interfaces = [face_id1, face_id, face_id2]
+        connections = [face_id1, face_id, face_id2]
+        if is_on_fault and faces[fault_conn_id].face_id1 in connections: connections.append(fault_conn_id)
+        return np.array(connections, dtype=np.intp), np.array(interfaces, dtype=np.intp)
     def get_full_stencil(self, cell_id, face_id=0):
         cell = self.mat_cell_info_dict[cell_id]
         faces = self.faces[cell_id]
-        res = []
-        num = 0
+        interfaces = []
+        connections = []
         #in_plain_num = 0
         for face_id, face in faces.items():
             #t_face1 = np.average(self.mesh_data.points[cell.nodes_to_faces[face], :], axis=0) - cell.centroid
@@ -1517,9 +1551,57 @@ class UnstructDiscretizer:
             #        in_plain_num += 1
             #else:
             if face.type != FType.MAT_TO_FRAC:
-                num += 1
-            res.append(face_id)
-        return num, np.array(res)
+                interfaces.append(face_id)
+            connections.append(face_id)
+        return np.array(connections, dtype=np.intp), np.array(interfaces, dtype=np.intp)
+    def get_full_augmented_stencil(self, cell_id, face_id=0):
+        cell = self.mat_cell_info_dict[cell_id]
+        faces = self.faces[cell_id]
+        interfaces = []
+        connections = []
+        #in_plain_num = 0
+        for face_id, face in faces.items():
+            if face.type != FType.MAT_TO_FRAC:
+                interfaces.append(face_id)
+            connections.append(face_id)
+
+        adj_ids = []
+        for node in cell.nodes_to_cell:
+            for cell_id1 in self.mat_cells_to_node[node]:
+                is_nebr = False
+                for face in faces.values():
+                    if cell_id1 == face.cell_id2 or cell_id1 == face.cell_id1:
+                        is_nebr = True
+                        break
+                if not is_nebr and cell_id1 not in adj_ids:
+                    adj_ids.append(cell_id1)
+
+        return np.array(connections, dtype=np.intp), np.array(interfaces, dtype=np.intp), np.array(adj_ids, dtype=np.intp)
+    def get_specific_stencil(self, cell_id, face_id):
+        cell = self.mat_cell_info_dict[cell_id]
+        faces = self.faces[cell_id]
+        cur_face = faces[face_id]
+        # Check if is_on_fault
+        is_on_fault = (False, -1)
+        for j, face in faces.items():
+            if face.type == FType.MAT_TO_FRAC:
+                is_on_fault[0] = True
+                is_on_fault[1] = j
+                break
+        interfaces = [face_id]
+        connections = [face_id]
+        if is_on_fault[0]: connections.append(is_on_fault[1])
+        in_plain_num = 1
+        for id, face in faces.items():
+            if id in connections: continue
+            if np.fabs(cur_face.centroid[2] - face.centroid[2]) > 1.E-5:
+                interfaces.append(id)
+                connections.append(id)
+            elif in_plain_num < 2:
+                interfaces.append(id)
+                connections.append(id)
+                in_plain_num += 1
+        return np.array(connections, dtype=np.intp), np.array(interfaces, dtype=np.intp)
     def get_frac_stencil(self, cell_id):
         faces = self.faces[cell_id]
         res = []
@@ -1581,8 +1663,7 @@ class UnstructDiscretizer:
             T = T1.dot(Tden).dot(T2)
             y1 = cell.centroid + r1 * n
             y2 = self.mat_cell_info_dict[cell_id2].centroid - r2 * n
-            G = T.dot(
-                np.outer(np.identity(self.n_dim), y1 - y2).reshape(self.n_dim, self.n_dim * self.n_dim)) + \
+            G = T.dot(np.kron(np.identity(self.n_dim), y1 - y2)) + \
                 r1 * T2.dot(Tden).dot(G1) + r2 * T1.dot(Tden).dot(G2)
         if face.type == FType.BORDER:
             r1 = np.inner(t_face1, n)
@@ -1591,8 +1672,7 @@ class UnstructDiscretizer:
             yb = face.centroid - r2 * n
             T1, G1 = self.get_normal_tangential_stiffness(stf1, n)
             T = T1 / r1
-            G = T1.dot(np.outer(np.identity(self.n_dim), y1 - yb).reshape(self.n_dim, self.n_dim * self.n_dim)) / r1 \
-                + G1
+            G = T1.dot(np.kron(np.identity(self.n_dim), y1 - yb)) / r1 + G1
         return T, G
     def get_fracture_sign(self, t_face):
         face = self.faces[self.mat_cells_tot][4]
@@ -1611,7 +1691,7 @@ class UnstructDiscretizer:
             pos = 0
             for j, cell_id2 in enumerate(frac_nebrs):
                 dx = self.frac_cell_info_dict[cell_id2].centroid - cell.centroid
-                R[j * n_dim:(j + 1) * n_dim, :] = np.outer(np.identity(n_dim), dx).reshape(n_dim, n_dim * n_dim)
+                R[j * n_dim:(j + 1) * n_dim, :] = np.kron(np.identity(self.n_dim), dx)
                 if cell_id not in stencil:
                     stencil[cell_id] = pos
                     pos += 1
@@ -1670,8 +1750,7 @@ class UnstructDiscretizer:
                          np.concatenate(
                              (n.dot(stf1[4] - stf2[4]), n.dot(stf1[3] - stf2[3]), n.dot(stf1[2] - stf2[2])))])
                     dx = self.mat_cell_info_dict[cell_id2].centroid - cell.centroid
-                    R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.outer(np.identity(self.n_dim), dx).reshape(
-                        self.n_dim, self.n_dim * self.n_dim) + r2 * np.linalg.inv(T2).dot(tmp)
+                    R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.kron(np.identity(self.n_dim), dx) + r2 * np.linalg.inv(T2).dot(tmp)
                     if cell_id2 not in stencil:
                         stencil[cell_id2] = []
                     stencil[cell_id2].append((j, np.identity(self.n_dim)))
@@ -1706,8 +1785,7 @@ class UnstructDiscretizer:
                                 stencil[cell_id] = []
                             stencil[cell_id].append((j, -alpha))
                     R[j * self.n_dim:(j + 1) * self.n_dim, :] = alpha.dot(
-                        np.outer(np.identity(self.n_dim), t_face1).reshape(
-                            self.n_dim, self.n_dim * self.n_dim)) + beta * P.dot(tmp)
+                        np.kron(np.identity(self.n_dim), t_face1)) + beta * P.dot(tmp)
                 elif face.type == FType.MAT_TO_FRAC:
                     j0 = np.argwhere(cur_faces == face.face_id1)[0][0]
                     face0 = self.faces[cell_id][cur_faces[j0]]
@@ -1719,10 +1797,10 @@ class UnstructDiscretizer:
                     r2 = np.inner(t_face2, n)
                     y2 = cell2.centroid - r2 * n
                     data = self.transversal_fluxes[face.cell_id2]
-                    tmp = -(np.outer(np.identity(n_dim), y2 - face.centroid).reshape(n_dim, n_dim * n_dim) - r2 * np.linalg.inv(T2).dot(G2)).dot(data[1])
+                    tmp = -(np.kron(np.identity(self.n_dim), y2 - face.centroid) - r2 * np.linalg.inv(T2).dot(G2)).dot(data[1])
 
                     assert(face.cell_id1 == face0.cell_id1 and face.face_id1 == face0.face_id1)
-                    sign = self.get_fracture_sign(t_face2)
+                    sign = self.get_fracture_sign(-t_face1)
                     if face.cell_id2 not in stencil:
                         stencil[face.cell_id2] = []
                     stencil[face.cell_id2].append((j0, -sign * np.identity(n_dim)))
@@ -1742,8 +1820,10 @@ class UnstructDiscretizer:
     def calc_transversal_fluxes_all_cells_new(self):
         self.transversal_fluxes = {}
         n_dim = self.n_dim
+        diag_id = np.arange(n_dim, dtype=np.intp)
         # Fracture gradient reconstruction
         for cell_id, cell in self.frac_cell_info_dict.items():
+            self.transversal_fluxes[cell_id] = {}
             frac_nebrs = self.get_frac_stencil(cell_id)
             stencil = {}
             R = np.zeros((len(frac_nebrs) * n_dim, n_dim * n_dim), dtype=np.float64)
@@ -1751,7 +1831,7 @@ class UnstructDiscretizer:
             pos = 0
             for j, cell_id2 in enumerate(frac_nebrs):
                 dx = self.frac_cell_info_dict[cell_id2].centroid - cell.centroid
-                R[j * n_dim:(j + 1) * n_dim, :] = np.outer(np.identity(n_dim), dx).reshape(n_dim, n_dim * n_dim)
+                R[j * n_dim:(j + 1) * n_dim, :] = np.kron(np.identity(self.n_dim), dx)
                 if cell_id not in stencil:
                     stencil[cell_id] = pos
                     pos += 1
@@ -1768,15 +1848,22 @@ class UnstructDiscretizer:
                 grads = np.linalg.pinv(R)
             else:
                 grads = np.linalg.inv(sq_mat).dot(R.T)
-            self.transversal_fluxes[cell_id] = (np.array(list(stencil.keys())), grads.dot(D))
+            self.transversal_fluxes[cell_id][0] = (np.array(list(stencil.keys())), grads.dot(D))
         # Matrix gradient reconstruction
         for cell_id, cell in self.mat_cell_info_dict.items():
-            num, cur_faces = self.get_full_stencil(cell_id)
+            self.transversal_fluxes[cell_id] = {}
+            cur_conns, cur_faces = self.get_full_stencil(cell_id)
+            num = cur_faces.size
             stencil = {}
             D = np.zeros((num * n_dim, (5 + num + 1) * n_dim), dtype=np.float64)
             R = np.zeros((num * n_dim, n_dim * n_dim), dtype=np.float64)
+            W = np.zeros((num * n_dim, num * n_dim), dtype=np.float64)
             pos = 0
-            for j, face_id in enumerate(cur_faces):
+            # Choosing the stencil
+            is_on_fault = 0
+            for face in self.faces[cell_id].values():
+                is_on_fault += (face.type == FType.MAT_TO_FRAC)
+            for j, face_id in enumerate(cur_conns):
                 face = self.faces[cell_id][face_id]
                 t_face1 = face.centroid - cell.centroid
                 n = face.n
@@ -1801,9 +1888,8 @@ class UnstructDiscretizer:
                              (n.dot(stf1[5] - stf2[5]), n.dot(stf1[1] - stf2[1]), n.dot((stf1[3] - stf2[3]).T))),
                          np.concatenate(
                              (n.dot(stf1[4] - stf2[4]), n.dot(stf1[3] - stf2[3]), n.dot(stf1[2] - stf2[2])))])
-                    dx = self.mat_cell_info_dict[cell_id2].centroid - cell.centroid
-                    R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.outer(np.identity(self.n_dim), dx).reshape(
-                        self.n_dim, self.n_dim * self.n_dim) + r2 * np.linalg.inv(T2).dot(tmp)
+                    dx = cell2.centroid - cell.centroid
+                    R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.kron(np.identity(self.n_dim), dx) + r2 * np.linalg.inv(T2).dot(tmp)
 
                     if cell_id not in stencil:
                         stencil[cell_id] = pos
@@ -1812,6 +1898,7 @@ class UnstructDiscretizer:
                         stencil[cell_id2] = pos
                         pos += 1
 
+                    W[j * n_dim + diag_id,j * n_dim + diag_id] = 1.0 / np.linalg.norm(dx)
                     D[j * self.n_dim:(j + 1) * n_dim,stencil[cell_id2] * n_dim:(stencil[cell_id2] + 1) * n_dim] = np.identity(n_dim)
                     D[j * self.n_dim:(j + 1) * n_dim,stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -np.identity(n_dim)
                 elif face.type == FType.BORDER:
@@ -1844,13 +1931,12 @@ class UnstructDiscretizer:
                                 stencil[cell_id] = pos
                                 pos += 1
                             D[j * self.n_dim:(j + 1) * n_dim,stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -alpha
-
-                    R[j * self.n_dim:(j + 1) * self.n_dim, :] = alpha.dot(
-                        np.outer(np.identity(self.n_dim), t_face1).reshape(
-                            self.n_dim, self.n_dim * self.n_dim)) + beta * P.dot(tmp)
+                    R[j * self.n_dim:(j + 1) * self.n_dim, :] = alpha.dot(np.kron(np.identity(self.n_dim), t_face1)) + \
+                                                                beta * P.dot(tmp)
+                    W[j * n_dim + diag_id,j * n_dim + diag_id] = 1.0 / np.linalg.norm(face.centroid - cell.centroid)
                 elif face.type == FType.MAT_TO_FRAC:
-                    j0 = np.argwhere(cur_faces == face.face_id1)[0][0]
-                    face0 = self.faces[cell_id][cur_faces[j0]]
+                    j0 = np.argwhere(cur_conns == face.face_id1)[0][0]
+                    face0 = self.faces[cell_id][cur_conns[j0]]
 
                     cell2 = self.mat_cell_info_dict[face0.cell_id2]
                     t_face2 = cell2.centroid - face.centroid
@@ -1858,11 +1944,11 @@ class UnstructDiscretizer:
                     T2, G2 = self.get_normal_tangential_stiffness(stf2, n)
                     r2 = np.inner(t_face2, n)
                     y2 = cell2.centroid - r2 * n
-                    data = self.transversal_fluxes[face.cell_id2]
-                    tmp = -(np.outer(np.identity(n_dim), y2 - face.centroid).reshape(n_dim, n_dim * n_dim) - r2 * np.linalg.inv(T2).dot(G2)).dot(data[1])
+                    data = self.transversal_fluxes[face.cell_id2][0]
+                    tmp = -(np.kron(np.identity(self.n_dim), y2 - face.centroid) - r2 * np.linalg.inv(T2).dot(G2)).dot(data[1])
 
                     assert(face.cell_id1 == face0.cell_id1 and face.face_id1 == face0.face_id1)
-                    sign = self.get_fracture_sign(t_face2)
+                    sign = self.get_fracture_sign(-t_face1)
                     # gap
                     if face.cell_id2 not in stencil:
                         stencil[face.cell_id2] = pos
@@ -1876,13 +1962,332 @@ class UnstructDiscretizer:
                             pos += 1
                         D[j0 * self.n_dim:(j0 + 1) * n_dim, stencil[id] * n_dim:
                                                 (stencil[id] + 1) * n_dim] += sign * tmp[:, pos1*n_dim:(pos1+1)*n_dim]
-            sq_mat = R.T.dot(R)
+            sq_mat = R.T.dot(W).dot(R)
             # rank_sq = np.linalg.matrix_rank(sq_mat)
             # rank = np.linalg.matrix_rank(R)
             # assert (rank_sq == sq_mat.shape[0])
             # cond = np.linalg.cond(sq_mat)
-            grads = np.linalg.inv(sq_mat).dot(R.T)
-            self.transversal_fluxes[cell_id] = (np.array(list(stencil.keys())), grads.dot(D[:, :pos*n_dim]))
+            grads = np.linalg.inv(sq_mat).dot(R.T).dot(W)
+            self.transversal_fluxes[cell_id][0] = (np.array(list(stencil.keys())), grads.dot(D[:, :pos*n_dim]))
+    def calc_transversal_fluxes_all_cells_new_homo_augmented(self):
+        self.transversal_fluxes = {}
+        n_dim = self.n_dim
+        diag_id = np.arange(n_dim, dtype=np.intp)
+        # Matrix gradient reconstruction
+        for cell_id, cell in self.mat_cell_info_dict.items():
+            self.transversal_fluxes[cell_id] = {}
+            cur_conns, cur_faces, adj_cells = self.get_full_augmented_stencil(cell_id)
+            num = cur_faces.size + adj_cells.size
+            stencil = {}
+            D = np.zeros((num * n_dim, (5 + num + 1) * n_dim), dtype=np.float64)
+            R = np.zeros((num * n_dim, n_dim * n_dim), dtype=np.float64)
+            W = np.zeros((num * n_dim, num * n_dim), dtype=np.float64)
+            pos = 0
+            # Choosing the stencil
+            for j, face_id in enumerate(cur_conns):
+                face = self.faces[cell_id][face_id]
+                t_face1 = face.centroid - cell.centroid
+                n = face.n
+                if np.inner(t_face1, n) < 0: n = -n
+                stf1 = self.stf[cell.prop_id]
+
+                cell_id2 = face.cell_id2
+                if face.type == FType.MAT:
+                    cell2 = self.mat_cell_info_dict[cell_id2]
+                    dx = cell2.centroid - cell.centroid
+                    R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.kron(np.identity(self.n_dim), dx)
+
+                    if cell_id not in stencil:
+                        stencil[cell_id] = pos
+                        pos += 1
+                    if cell_id2 not in stencil:
+                        stencil[cell_id2] = pos
+                        pos += 1
+
+                    W[j * n_dim + diag_id,j * n_dim + diag_id] = 1.0# / np.linalg.norm(dx)
+                    D[j * self.n_dim:(j + 1) * n_dim,stencil[cell_id2] * n_dim:(stencil[cell_id2] + 1) * n_dim] = np.identity(n_dim)
+                    D[j * self.n_dim:(j + 1) * n_dim,stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -np.identity(n_dim)
+                elif face.type == FType.BORDER:
+                    # Boundary
+                    bound_id = face.face_id2
+                    bc_data = self.bc_mech[self.bcm_num * bound_id:self.bcm_num * (bound_id + 1)]
+                    P = np.identity(self.n_dim)
+                    tmp = np.array(
+                        [np.concatenate((n.dot(stf1[0]), n.dot((stf1[5]).T), n.dot((stf1[4]).T))),
+                         np.concatenate((n.dot(stf1[5]), n.dot(stf1[1]), n.dot((stf1[3]).T))),
+                         np.concatenate((n.dot(stf1[4]), n.dot(stf1[3]), n.dot(stf1[2])))])
+                    bound_num = self.mat_cells_tot + self.frac_cells_tot + bound_id
+                    alpha = bc_data[0] * np.identity(self.n_dim)
+                    beta = bc_data[1]
+                    if bc_data[2] == self.Prol:
+                        P -= np.outer(n, n)
+                        alpha = np.outer(n, n)
+                        if cell_id not in stencil:
+                            stencil[cell_id] = pos
+                            pos += 1
+                        D[j * self.n_dim:(j + 1) * n_dim,stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -alpha
+                    else:
+                        if bound_num not in stencil:
+                            stencil[bound_num] = pos
+                            pos += 1
+                        D[j * self.n_dim:(j + 1) * n_dim,stencil[bound_num] * n_dim:(stencil[bound_num] + 1) * n_dim] = np.identity(n_dim)
+
+                        if (alpha != 0.0).any():
+                            if cell_id not in stencil:
+                                stencil[cell_id] = pos
+                                pos += 1
+                            D[j * self.n_dim:(j + 1) * n_dim,stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -alpha
+                    R[j * self.n_dim:(j + 1) * self.n_dim, :] = alpha.dot(np.kron(np.identity(self.n_dim), t_face1)) + \
+                                                                beta * P.dot(tmp)
+                    W[j * n_dim + diag_id,j * n_dim + diag_id] = 1.0# / np.linalg.norm(face.centroid - cell.centroid)
+                elif face.type == FType.MAT_TO_FRAC:
+                    j0 = np.argwhere(cur_conns == face.face_id1)[0][0]
+                    face0 = self.faces[cell_id][cur_conns[j0]]
+
+                    cell2 = self.mat_cell_info_dict[face0.cell_id2]
+                    t_face2 = cell2.centroid - face.centroid
+                    stf2 = self.stf[cell2.prop_id]
+                    T2, G2 = self.get_normal_tangential_stiffness(stf2, n)
+                    r2 = np.inner(t_face2, n)
+                    y2 = cell2.centroid - r2 * n
+                    data = self.transversal_fluxes[face.cell_id2][0]
+                    tmp = -(np.kron(np.identity(self.n_dim), y2 - face.centroid) - r2 * np.linalg.inv(T2).dot(G2)).dot(data[1])
+
+                    assert(face.cell_id1 == face0.cell_id1 and face.face_id1 == face0.face_id1)
+                    sign = self.get_fracture_sign(-t_face1)
+                    # gap
+                    if face.cell_id2 not in stencil:
+                        stencil[face.cell_id2] = pos
+                        pos += 1
+                    D[j0 * self.n_dim:(j0 + 1) * n_dim, stencil[face.cell_id2] * n_dim:
+                                                      (stencil[face.cell_id2] + 1) * n_dim] += -sign * np.identity(n_dim)
+                    # gap gradients
+                    for pos1, id in enumerate(data[0]):
+                        if id not in stencil:
+                            stencil[id] = pos
+                            pos += 1
+                        D[j0 * self.n_dim:(j0 + 1) * n_dim, stencil[id] * n_dim:
+                                                (stencil[id] + 1) * n_dim] += sign * tmp[:, pos1*n_dim:(pos1+1)*n_dim]
+            # Augmented
+            for j0, cell_id2 in enumerate(adj_cells):
+                j = j0 + cur_faces.size
+                cell2 = self.mat_cell_info_dict[cell_id2]
+                dx = cell2.centroid - cell.centroid
+
+                if cell_id not in stencil:
+                    stencil[cell_id] = pos
+                    pos += 1
+                if cell_id2 not in stencil:
+                    stencil[cell_id2] = pos
+                    pos += 1
+
+                R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.kron(np.identity(self.n_dim), dx)
+                W[j * n_dim + diag_id, j * n_dim + diag_id] = 1.0# / np.linalg.norm(dx)
+                D[j * self.n_dim:(j + 1) * n_dim, stencil[cell_id2] * n_dim:(stencil[cell_id2] + 1) * n_dim] = np.identity(
+                    n_dim)
+                D[j * self.n_dim:(j + 1) * n_dim, stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -np.identity(
+                    n_dim)
+            sq_mat = R.T.dot(W).dot(R)
+            # rank_sq = np.linalg.matrix_rank(sq_mat)
+            # rank = np.linalg.matrix_rank(R)
+            # assert (rank_sq == sq_mat.shape[0])
+            # cond = np.linalg.cond(sq_mat)
+            grads = np.linalg.inv(sq_mat).dot(R.T).dot(W)
+            self.transversal_fluxes[cell_id][0] = (np.array(list(stencil.keys())), grads.dot(D[:, :pos*n_dim]))
+    def calc_transversal_fluxes_all_cells_all_faces(self):
+        self.transversal_fluxes = {}
+        n_dim = self.n_dim
+        # Fracture gradient reconstruction
+        for cell_id, cell in self.frac_cell_info_dict.items():
+            self.transversal_fluxes[cell_id] = {}
+            frac_nebrs = self.get_frac_stencil(cell_id)
+            stencil = {}
+            R = np.zeros((len(frac_nebrs) * n_dim, n_dim * n_dim), dtype=np.float64)
+            D = np.zeros((len(frac_nebrs) * n_dim, (len(frac_nebrs) + 1) * n_dim), dtype=np.float64)
+            pos = 0
+            for j, cell_id2 in enumerate(frac_nebrs):
+                dx = self.frac_cell_info_dict[cell_id2].centroid - cell.centroid
+                R[j * n_dim:(j + 1) * n_dim, :] = np.kron(np.identity(self.n_dim), dx)
+                if cell_id not in stencil:
+                    stencil[cell_id] = pos
+                    pos += 1
+                if cell_id2 not in stencil:
+                    stencil[cell_id2] = pos
+                    pos += 1
+
+                D[j * self.n_dim:(j + 1) * n_dim,
+                stencil[cell_id2] * n_dim:(stencil[cell_id2] + 1) * n_dim] = np.identity(n_dim)
+                D[j * self.n_dim:(j + 1) * n_dim,
+                stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -np.identity(n_dim)
+
+            sq_mat = R.T.dot(R)
+            rank_sq = np.linalg.matrix_rank(sq_mat)
+            if rank_sq < self.n_dim * self.n_dim:
+                grads = np.linalg.pinv(R)
+            else:
+                grads = np.linalg.inv(sq_mat).dot(R.T)
+            self.transversal_fluxes[cell_id][0] = (np.array(list(stencil.keys())), grads.dot(D))
+        # Matrix gradient reconstruction
+        for cell_id, cell in self.mat_cell_info_dict.items():
+            self.transversal_fluxes[cell_id] = {}
+            all_conns, all_faces = self.get_full_stencil(cell_id)
+            # Specific reconstruction for each face
+            for face_id0 in all_faces:
+                cur_conns, cur_faces = self.get_not_coplanar_stencil(cell_id, face_id0)
+                num = cur_faces.size
+                stencil = {}
+                D = np.zeros((num * n_dim, (5 + num + 1) * n_dim), dtype=np.float64)
+                R = np.zeros((num * n_dim, n_dim * n_dim), dtype=np.float64)
+                pos = 0
+                # Choosing the stencil
+                is_on_fault = 0
+                for face in self.faces[cell_id].values():
+                    is_on_fault += (face.type == FType.MAT_TO_FRAC)
+                for j, face_id in enumerate(cur_conns):
+                    face = self.faces[cell_id][face_id]
+                    t_face1 = face.centroid - cell.centroid
+                    n = face.n
+                    if np.inner(t_face1, n) < 0: n = -n
+                    stf1 = self.stf[cell.prop_id]
+
+                    cell_id2 = face.cell_id2
+                    if face.type == FType.MAT:
+                        cell2 = self.mat_cell_info_dict[cell_id2]
+                        t_face2 = self.mat_cell_info_dict[cell_id2].centroid - face.centroid
+                        stf2 = self.stf[cell2.prop_id]
+
+                        T1, G1 = self.get_normal_tangential_stiffness(stf1, n)
+                        T2, G2 = self.get_normal_tangential_stiffness(stf2, n)
+                        r1 = np.inner(t_face1, n)
+                        r2 = np.inner(t_face2, n)
+
+                        tmp = np.array(
+                            [np.concatenate(
+                                (n.dot(stf1[0] - stf2[0]), n.dot((stf1[5] - stf2[5]).T), n.dot((stf1[4] - stf2[4]).T))),
+                                np.concatenate(
+                                    (n.dot(stf1[5] - stf2[5]), n.dot(stf1[1] - stf2[1]), n.dot((stf1[3] - stf2[3]).T))),
+                                np.concatenate(
+                                    (n.dot(stf1[4] - stf2[4]), n.dot(stf1[3] - stf2[3]), n.dot(stf1[2] - stf2[2])))])
+                        dx = self.mat_cell_info_dict[cell_id2].centroid - cell.centroid
+                        R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.kron(np.identity(self.n_dim), dx) + r2 * np.linalg.inv(T2).dot(tmp)
+
+                        if cell_id not in stencil:
+                            stencil[cell_id] = pos
+                            pos += 1
+                        if cell_id2 not in stencil:
+                            stencil[cell_id2] = pos
+                            pos += 1
+
+                        D[j * self.n_dim:(j + 1) * n_dim,
+                        stencil[cell_id2] * n_dim:(stencil[cell_id2] + 1) * n_dim] = np.identity(n_dim)
+                        D[j * self.n_dim:(j + 1) * n_dim,
+                        stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -np.identity(n_dim)
+                    elif face.type == FType.BORDER:
+                        # Boundary
+                        bound_id = face.face_id2
+                        bc_data = self.bc_mech[self.bcm_num * bound_id:self.bcm_num * (bound_id + 1)]
+                        P = np.identity(self.n_dim)
+                        tmp = np.array(
+                            [np.concatenate((n.dot(stf1[0]), n.dot((stf1[5]).T), n.dot((stf1[4]).T))),
+                             np.concatenate((n.dot(stf1[5]), n.dot(stf1[1]), n.dot((stf1[3]).T))),
+                             np.concatenate((n.dot(stf1[4]), n.dot(stf1[3]), n.dot(stf1[2])))])
+                        bound_num = self.mat_cells_tot + self.frac_cells_tot + bound_id
+                        alpha = bc_data[0] * np.identity(self.n_dim)
+                        beta = bc_data[1]
+                        if bc_data[2] == self.Prol:
+                            P -= np.outer(n, n)
+                            alpha = np.outer(n, n)
+                            if cell_id not in stencil:
+                                stencil[cell_id] = pos
+                                pos += 1
+                            D[j * self.n_dim:(j + 1) * n_dim,
+                            stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -alpha
+                        else:
+                            if bound_num not in stencil:
+                                stencil[bound_num] = pos
+                                pos += 1
+                            D[j * self.n_dim:(j + 1) * n_dim,
+                            stencil[bound_num] * n_dim:(stencil[bound_num] + 1) * n_dim] = np.identity(n_dim)
+
+                            if (alpha != 0.0).any():
+                                if cell_id not in stencil:
+                                    stencil[cell_id] = pos
+                                    pos += 1
+                                D[j * self.n_dim:(j + 1) * n_dim,
+                                stencil[cell_id] * n_dim:(stencil[cell_id] + 1) * n_dim] = -alpha
+                        R[j * self.n_dim:(j + 1) * self.n_dim, :] = alpha.dot(
+                            np.kron(np.identity(self.n_dim), t_face1)) + beta * P.dot(tmp)
+                    elif face.type == FType.MAT_TO_FRAC:
+                        j0 = np.argwhere(cur_conns == face.face_id1)[0][0]
+                        face0 = self.faces[cell_id][cur_conns[j0]]
+
+                        cell2 = self.mat_cell_info_dict[face0.cell_id2]
+                        t_face2 = cell2.centroid - face.centroid
+                        stf2 = self.stf[cell2.prop_id]
+                        T2, G2 = self.get_normal_tangential_stiffness(stf2, n)
+                        r2 = np.inner(t_face2, n)
+                        y2 = cell2.centroid - r2 * n
+                        data = self.transversal_fluxes[face.cell_id2][0]
+                        tmp = -(np.kron(np.identity(self.n_dim), y2 - face.centroid) - r2 * np.linalg.inv(
+                            T2).dot(G2)).dot(data[1])
+
+                        assert (face.cell_id1 == face0.cell_id1 and face.face_id1 == face0.face_id1)
+                        sign = self.get_fracture_sign(-t_face1)
+                        # gap
+                        if face.cell_id2 not in stencil:
+                            stencil[face.cell_id2] = pos
+                            pos += 1
+                        D[j0 * self.n_dim:(j0 + 1) * n_dim, stencil[face.cell_id2] * n_dim:
+                                                            (stencil[face.cell_id2] + 1) * n_dim] += -sign * np.identity(
+                            n_dim)
+                        # gap gradients
+                        for pos1, id in enumerate(data[0]):
+                            if id not in stencil:
+                                stencil[id] = pos
+                                pos += 1
+                            D[j0 * self.n_dim:(j0 + 1) * n_dim, stencil[id] * n_dim:
+                                                                (stencil[id] + 1) * n_dim] += sign * tmp[:, pos1 * n_dim:(
+                                                                                                                                     pos1 + 1) * n_dim]
+                sq_mat = R.T.dot(R)
+                # rank_sq = np.linalg.matrix_rank(sq_mat)
+                # rank = np.linalg.matrix_rank(R)
+                # assert (rank_sq == sq_mat.shape[0])
+                # cond = np.linalg.cond(sq_mat)
+                grads = np.linalg.inv(sq_mat).dot(R.T)
+                #self.transversal_fluxes[cell_id][face_id0] = (np.array(list(stencil.keys())), grads.dot(D[:, :pos * n_dim]))
+
+                face = self.faces[cell_id][face_id0]
+                t_face1 = face.centroid - cell.centroid
+                n = face.n
+                if np.inner(t_face1, n) < 0: n = -n
+                stf1 = self.stf[cell.prop_id]
+
+                cell_id2 = face.cell_id2
+                if face.type != FType.BORDER:
+                    Tden, T = self.calc_harmonic_flux([cell_id, cell_id2], [face_id0, face.face_id2])
+
+                if cell_id != cell_id2:
+                    cell2 = self.mat_cell_info_dict[cell_id2]
+                    t_face2 = self.mat_cell_info_dict[cell_id2].centroid - face.centroid
+                    stf2 = self.stf[cell2.prop_id]
+                    T1, G1 = self.get_normal_tangential_stiffness(stf1, n)
+                    T2, G2 = self.get_normal_tangential_stiffness(stf2, n)
+                    r1 = np.inner(t_face1, n)
+                    r2 = np.inner(t_face2, n)
+                    y1 = cell.centroid + r1 * n
+                    y2 = self.mat_cell_info_dict[cell_id2].centroid - r2 * n
+                    G = T.dot(np.kron(np.identity(self.n_dim), y1-y2)) + \
+                        r1 * T2.dot(Tden).dot(G1) + r2 * T1.dot(Tden).dot(G2)
+                else:
+                    r1 = np.inner(t_face1, n)
+                    y1 = cell.centroid + r1 * n
+                    r2 = 0
+                    yb = face.centroid - r2 * n
+                    T1, G1 = self.get_normal_tangential_stiffness(stf1, n)
+                    G = T1.dot(np.kron(np.identity(self.n_dim), y1 - yb)) / r1 + G1
+
+                G = G.dot(np.kron(np.identity(self.n_dim), np.identity(self.n_dim) - np.outer(n, n)))
+                self.transversal_fluxes[cell_id][face_id0] = np.array(list(stencil.keys()), dtype=np.intp), G.dot(grads.dot(D[:, :pos * n_dim]))
     def get_transversal_flux(self, cell_id, face_id, T, Tden):
         cell = self.mat_cell_info_dict[cell_id]
         face = self.faces[cell_id][face_id]
@@ -1902,8 +2307,7 @@ class UnstructDiscretizer:
             r2 = np.inner(t_face2, n)
             y1 = cell.centroid + r1 * n
             y2 = self.mat_cell_info_dict[cell_id2].centroid - r2 * n
-            G = T.dot(
-                np.outer(np.identity(self.n_dim), y1 - y2).reshape(self.n_dim, self.n_dim * self.n_dim)) + \
+            G = T.dot(np.kron(np.identity(self.n_dim), y1 - y2)) + \
                 r1 * T2.dot(Tden).dot(G1) + r2 * T1.dot(Tden).dot(G2)
         else:
             r1 = np.inner(t_face1, n)
@@ -1911,12 +2315,9 @@ class UnstructDiscretizer:
             r2 = 0
             yb = face.centroid - r2 * n
             T1, G1 = self.get_normal_tangential_stiffness(stf1, n)
-            G = T1.dot(np.outer(np.identity(self.n_dim), y1 - yb).reshape(self.n_dim, self.n_dim * self.n_dim)) / r1 \
-                + G1
-        mult = np.multiply.outer(np.identity(self.n_dim), np.identity(self.n_dim) - np.outer(n, n))
-        G = G.dot(mult.swapaxes(1,2).reshape(self.n_dim * self.n_dim,-1))
-
-        data = self.transversal_fluxes[cell_id]
+            G = T1.dot(np.kron(np.identity(self.n_dim), y1 - yb)) / r1 + G1
+        G = G.dot(np.kron(np.identity(self.n_dim), np.identity(self.n_dim) - np.outer(n, n)))
+        data = self.transversal_fluxes[cell_id][0]
         return data[0], G.dot(data[1])
     def calc_transversal_flux(self, cell_id, face_id, T, Tden):
         G = np.zeros((self.n_dim, self.n_dim * self.n_dim), dtype=np.float64)
@@ -1945,18 +2346,15 @@ class UnstructDiscretizer:
                 if face_id1 == face_id:
                     y1 = cell.centroid + r1 * n
                     y2 = self.mat_cell_info_dict[cell_id2].centroid - r2 * n
-                    G = T.dot(
-                        np.outer(np.identity(self.n_dim), y1 - y2).reshape(self.n_dim, self.n_dim * self.n_dim)) + \
+                    G = T.dot(np.kron(np.identity(self.n_dim), y1 - y2)) + \
                            r1 * T2.dot(Tden).dot(G1) + r2 * T1.dot(Tden).dot(G2)
-                    G = G.dot(np.outer(np.identity(self.n_dim), np.identity(self.n_dim) - np.outer(n, n)))
+                    G = G.dot(np.kron(np.identity(self.n_dim), np.identity(self.n_dim) - np.outer(n, n)))
                 tmp = np.array(
                     [np.concatenate((n.dot(stf1[0] - stf2[0]), n.dot((stf1[5] - stf2[5]).T), n.dot((stf1[4] - stf2[4]).T))),
                      np.concatenate((n.dot(stf1[5] - stf2[5]), n.dot(stf1[1] - stf2[1]), n.dot((stf1[3] - stf2[3]).T))),
                      np.concatenate((n.dot(stf1[4] - stf2[4]), n.dot(stf1[3] - stf2[3]), n.dot(stf1[2] - stf2[2])))])
-                R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.outer(np.identity(self.n_dim),
-                                                                        self.mat_cell_info_dict[cell_id2].centroid -
-                                                                        cell.centroid).reshape(
-                    self.n_dim, self.n_dim * self.n_dim) + r2 * np.linalg.inv(T2).dot(tmp)
+                R[j * self.n_dim:(j + 1) * self.n_dim, :] = np.kron(np.identity(self.n_dim), self.mat_cell_info_dict[cell_id2].centroid -
+                                                                        cell.centroid) + r2 * np.linalg.inv(T2).dot(tmp)
                 if cell_id2 not in stencil:
                     stencil[cell_id2] = []
                 stencil[cell_id2].append((j, 1.0))
@@ -1974,9 +2372,7 @@ class UnstructDiscretizer:
                     [np.concatenate((n.dot(stf1[0]), n.dot((stf1[5]).T), n.dot((stf1[4]).T))),
                      np.concatenate((n.dot(stf1[5]), n.dot(stf1[1]), n.dot((stf1[3]).T))),
                      np.concatenate((n.dot(stf1[4]), n.dot(stf1[3]), n.dot(stf1[2])))])
-                R[j * self.n_dim:(j + 1) * self.n_dim, :] = bc_data[0] * \
-                        np.outer(np.identity(self.n_dim), t_face1).reshape(self.n_dim,self.n_dim*self.n_dim) + \
-                                                            bc_data[1] * P.dot(tmp)
+                R[j * self.n_dim:(j + 1) * self.n_dim, :] = bc_data[0] * np.kron(np.identity(self.n_dim), t_face1) + bc_data[1] * P.dot(tmp)
                 bound_num = self.mat_cells_tot + bound_id
                 if bound_num not in stencil:
                     stencil[bound_num] = []
@@ -1992,9 +2388,8 @@ class UnstructDiscretizer:
                     r2 = 0
                     yb = face.centroid - r2 * n
                     T1, G1 = self.get_normal_tangential_stiffness(stf1, n)
-                    G = T1.dot(np.outer(np.identity(self.n_dim), y1 - yb).reshape(self.n_dim, self.n_dim * self.n_dim)) / r1\
-                        + G1
-                    G = G.dot(np.outer(np.identity(self.n_dim), np.identity(self.n_dim) - np.outer(n, n)))
+                    G = T1.dot(np.kron(np.identity(self.n_dim),y1 - yb)) / r1 + G1
+                    G = G.dot(np.kron(np.identity(self.n_dim), np.identity(self.n_dim) - np.outer(n, n)))
 
         sq_mat = R.T.dot(R)
         #rank_sq = np.linalg.matrix_rank(sq_mat)
@@ -2168,12 +2563,12 @@ class UnstructDiscretizer:
             T = T1.dot(Tden).dot(T2)
             y1 = cell.centroid + r1 * n
             y2 = cell2.centroid - r2 * n
-            G = T.dot(np.outer(np.identity(self.n_dim), face.centroid - y2).reshape(self.n_dim, self.n_dim * self.n_dim)) + \
-                T.T.dot(np.outer(np.identity(self.n_dim), y1 - face.centroid).reshape(self.n_dim, self.n_dim * self.n_dim)) + \
+            G = T.dot(np.kron(np.identity(self.n_dim), face.centroid - y2)) + \
+                T.T.dot(np.kron(np.identity(self.n_dim), y1 - face.centroid)) + \
                 r2 * T1.dot(Tden).dot(G2) - r1 * T2.dot(Tden).dot(G1)
 
             t_face1 = face.centroid - self.mat_cell_info_dict[cell_id1].centroid
-            sign = self.get_fracture_sign(t_face1)
+            sign = self.get_fracture_sign(-t_face1)
             conn0, conn1, conn2 = self.mpsa_connections[cell_id1][face.face_id1]
             pos = 0
             if cell_id2 not in conn1:
@@ -2223,11 +2618,13 @@ class UnstructDiscretizer:
                                               face.area * np.array([-T, T]))
             # Calculate transversal parts of the flux for both cells
             stencil, a = self.get_transversal_flux(cell_id1, face_id1, T, Tden)
+            #stencil, a = self.transversal_fluxes[cell_id1][face_id1]
             a = np.array(np.hsplit(a, stencil.size))
             non_zero_ind = (np.fabs(a) > self.tol).any(axis=(1, 2))
             self.Ft1[cell_id1][face_id1] = ((cell_id2, face_id2), stencil[non_zero_ind], face.area * a[non_zero_ind])
 
             stencil, a = self.get_transversal_flux(cell_id2, face_id2, T.T, Tden)
+            #stencil, a = self.transversal_fluxes[cell_id2][face_id2]
             a = np.array(np.hsplit(a,stencil.size))
             non_zero_ind = (np.fabs(a) > self.tol).any(axis=(1, 2))
             self.Ft2[cell_id1][face_id1] = ((cell_id2, face_id2), stencil[non_zero_ind], -face.area * a[non_zero_ind])
@@ -2250,6 +2647,7 @@ class UnstructDiscretizer:
             P = np.identity(self.n_dim)
 
             stencil, a = self.get_transversal_flux(cell_id1, face_id1, 0.0, 0.0)
+            #stencil, a = self.transversal_fluxes[cell_id1][face_id1]
             if bc_data[2] == self.P12:  # Dirichlet / Neumann boundary
                 tmp = np.linalg.inv(bc_data[0] * np.identity(self.n_dim) + bc_data[1] * P.dot(T1) / r1)
                 T = T1.dot(tmp) / r1
@@ -2301,13 +2699,13 @@ class UnstructDiscretizer:
             T = T1.dot(Tden).dot(T2)
             y1 = cell.centroid + r1 * n
             y2 = cell2.centroid - r2 * n
-            Gt1 = T.dot(np.outer(np.identity(self.n_dim), face.centroid - y2).reshape(self.n_dim, self.n_dim * self.n_dim)) + \
+            Gt1 = T.dot(np.kron(np.identity(self.n_dim), face.centroid - y2)) + \
                 r2 * T1.dot(Tden).dot(G2)
-            Gt2 = T.T.dot(np.outer(np.identity(self.n_dim), y1 - face.centroid).reshape(self.n_dim, self.n_dim * self.n_dim)) - \
+            Gt2 = T.T.dot(np.kron(np.identity(self.n_dim), y1 - face.centroid)) - \
                 r1 * T2.dot(Tden).dot(G1)
 
             t_face1 = face.centroid - self.mat_cell_info_dict[cell_id1].centroid
-            sign = self.get_fracture_sign(t_face1)
+            sign = self.get_fracture_sign(-t_face1)
             conn0, conn1, conn2 = self.Fharm[cell_id1][face.face_id1]
             pos = 0
             if cell_id2 not in conn1:
@@ -2320,7 +2718,7 @@ class UnstructDiscretizer:
             self.Fharm[cell_id1][face.face_id1] = (conn0, conn1, conn2)
             self.Fharm[cell_id1][face.face_id1][2][np.where(np.fabs(self.Fharm[cell_id1][face.face_id1][2]) < self.tol)] = 0.0
 
-            data = self.transversal_fluxes[cell_id2]
+            data = self.transversal_fluxes[cell_id2][0]
             if cell_id1 not in self.Fcont1:
                 self.Fcont1[cell_id1] = {}
             if cell_id1 not in self.Fcont2:
@@ -2332,14 +2730,25 @@ class UnstructDiscretizer:
             self.Fcont2[cell_id1][face.face_id1][2][np.where(np.fabs(self.Fcont2[cell_id1][face.face_id1][2]) < self.tol)] = 0.0
     def calc_frictionless_fracture_connection(self, cell_id):
         face1 = self.faces[cell_id][4]
-        face2 = self.faces[cell_id][5]
+        if self.get_fracture_sign(face1.n) > 0.0:
+            face1 = self.faces[cell_id][5]
+
+        S = np.zeros((self.n_dim, self.n_dim))
+        S[:self.n_dim-1] = null_space(np.array([face1.n])).T
+        S[self.n_dim-1] = face1.n
+        Sinv = np.linalg.inv(S)
 
         conn = self.mpsa_connections[face1.cell_id2][face1.face_id2]
         P = np.identity(self.n_dim) - np.outer(face1.n, face1.n)
-        F = np.concatenate(conn[2].transpose(0, 2, 1)).T
+        F = np.concatenate(conn[2].transpose(0, 2, 1)).T / face1.area
         Ftan = P.dot(F)
         pos = np.argwhere(conn[1] == cell_id)[0][0]
-        Ftan[:,pos*self.n_dim:(pos+1)*self.n_dim][1] += face1.area * face1.n
+
+        Ftan = S.dot(Ftan).dot(np.kron(np.identity(conn[1].size), Sinv))
+        Ftan[2, pos * self.n_dim:(pos + 1) * self.n_dim] = S.dot(face1.n)
+        Ftan = Ftan.dot(np.kron(np.identity(conn[1].size), S))
+        self.f[self.n_dim * cell_id:self.n_dim * (cell_id + 1)] = 0.0
+
         #Ftan[:,pos*self.n_dim:(pos+1)*self.n_dim][2] += face1.area * np.array([0.0,0.0,1.0])
         return (cell_id, 0), conn[1], np.array(np.hsplit(Ftan,conn[1].size))
         #return (cell_id, 0), np.array([cell_id]), np.array([np.identity(self.n_dim)])
@@ -2378,10 +2787,49 @@ class UnstructDiscretizer:
             if diff < 1.E-12: break
 
         return x_loc, jac
+    def get_variables(self, ids, type):
+        size = self.bcm_num
+        if type == 'new': x = self.x_new
+        elif type == 'iter': x = self.x_iter
+        elif type == 'prev': x = self.x_prev
+        x_new = np.zeros((ids.size, self.n_dim))
+        for i, id in enumerate(ids):
+            if id >= self.mat_cells_tot + self.frac_cells_tot:
+                bound_id = id - self.mat_cells_tot - self.frac_cells_tot
+                x_new[i] = self.bc_mech[size * bound_id + 3:size * (bound_id + 1)]
+            else:
+                x_new[i] = x[id]
+        return x_new
+
+    def get_friction_and_derivative(self, slip):
+        if np.isscalar(slip):
+            if slip < self.d:
+                mu = self.mu - (self.mu - self.mu_min) / self.d * slip
+                mu_dslip = - (self.mu - self.mu_min) / self.d
+            else:
+                mu = self.mu_min
+                mu_dslip = 0.0
+            return mu, mu_dslip
+        else:
+            mu = np.zeros(slip.size)
+            mu_dslip = np.zeros(slip.size)
+            id1 = slip < d
+            mu[id1] = self.mu - (self.mu - self.mu) / self.d * slip[id1]
+            mu_dslip[id1] = - (self.mu - self.mu) / self.d
+
+            id2 = slip >= d
+            mu[id2] = self.mu_min
+            mu_dslip[id2] = 0.0
+            return mu, mu_dslip
     def return_mapping(self, cell_id):
         face1 = self.faces[cell_id][4]
         if self.get_fracture_sign(face1.n) > 0.0:
             face1 = self.faces[cell_id][5]
+
+        S = np.zeros((self.n_dim, self.n_dim))
+        S[:self.n_dim-1] = null_space(np.array([face1.n])).T
+        S[self.n_dim-1] = face1.n
+        Sinv = np.linalg.inv(S)
         #sign = self.get_fracture_sign(face1.centroid-self.mat_cell_info_dict[face1.cell_id2].centroid)
         conn = self.mpsa_connections[face1.cell_id2][face1.face_id2]
         P = np.identity(self.n_dim) - np.outer(face1.n, face1.n)
@@ -2391,9 +2839,9 @@ class UnstructDiscretizer:
         Ft_coef = P.dot(F_coef)
         #dFndg = Fn_coef[:,pos*self.n_dim:(pos+1)*self.n_dim]
         # Values
-        F = F_coef.dot(self.x_new[conn[1]].flatten())
-        Fn_vec = Fn_coef.dot(self.x_new[conn[1]].flatten())
-        Fn = face1.n.dot(F)
+        F = F_coef.dot(self.get_variables(conn[1], 'new').flatten())
+        Fn_vec = Fn_coef.dot(self.get_variables(conn[1], 'new').flatten())
+        Fn = max(0.0, face1.n.dot(F))
         Ft = P.dot(F)
 
         Ft_prev = self.Ft_prev[cell_id]
@@ -2402,38 +2850,6 @@ class UnstructDiscretizer:
         x_iter = P.dot(self.x_iter[cell_id])
         x = P.dot(self.x_prev[cell_id])
         eps_t = self.eps_t
-        # local unknowns - tangential traction and lagrange multiplier
-        # x_loc = np.zeros(4)
-        # x_loc[:3] = Ft_prev + eps_t * (x_new - x)
-        # norm = np.linalg.norm(x_loc[:3])
-        # # RHS
-        # rhs = np.zeros(4)
-        # rhs[:3] = x_new - x - x_loc[3] * x_loc[:3] / norm - (x_loc[:3] - Ft_prev) / eps_t
-        # rhs[3] = norm + self.mu * Fn
-        # # local jacobian
-        # jac = np.zeros((4, 4))
-        # jac[:3,:3] = x_loc[3] / norm * (np.outer(x_loc[:3] / norm, x_loc[:3] / norm) - np.identity(3)) - np.identity(3) / eps_t
-        # jac[:3,3] = -x_loc[:3] / norm
-        # jac[3,:3] = x_loc[:3] / norm
-        # # residual derivative with respect to gap
-        # jac_gap = np.zeros((4, 4))
-        # jac_gap[:3,:3] = P
-        # jac_gap[3,3] = self.mu
-        #
-        # for i in range(50):
-        #     jac_pinv = np.linalg.inv(jac)
-        #     assert((np.fabs(jac_pinv.dot(jac) - np.identity(4)) < 1.E-8).all())
-        #     x_loc -= jac_pinv.dot(rhs)
-        #     norm = np.linalg.norm(x_loc[:3])
-        #     diff = np.linalg.norm(jac_pinv.dot(rhs))
-        #     # RHS
-        #     rhs[:3] = x_new - x - x_loc[3] * x_loc[:3] / norm - (x_loc[:3] - Ft_prev) / eps_t
-        #     rhs[3] = norm + self.mu * Fn
-        #     jac[:3, :3] = x_loc[3] / norm * (
-        #                 np.outer(x_loc[:3] / norm, x_loc[:3] / norm) - np.identity(3)) - np.identity(3) / eps_t
-        #     jac[:3, 3] = -x_loc[:3] / norm
-        #
-        #     if diff < 1.E-12: break
 
         pos = np.argwhere(conn[1] == cell_id)[0][0]
         #adv_gap = np.array([0.001,0.0,0.0])
@@ -2446,7 +2862,7 @@ class UnstructDiscretizer:
         #jac_simple = eps_t * P - eps_t / norm_trial ** 2 * np.outer(Ft_trial, Ft_trial).dot(P) - Phi_trial / norm_trial * (eps_t * P - eps_t / norm_trial ** 2 * np.outer(Ft_trial, Ft_trial).dot(P))
         #####
         Ft_norm = np.linalg.norm(Ft)
-        dFn_norm = Fn_vec.dot(Fn_coef) / Fn
+        dFn_norm = Fn_vec.dot(Fn_coef) / Fn if Fn > 0 else Fn_vec.dot(Fn_coef) / 1.E-8
         dFt_norm = Ft.dot(Ft_coef) / Ft_norm
         gt_norm = np.linalg.norm(x_new)
         if gt_norm == 0.0:
@@ -2454,27 +2870,34 @@ class UnstructDiscretizer:
         dgt_norm = x_new.dot(P) / gt_norm
         #H = Ft_coef + self.mu / Ft_norm * (np.outer(Ft, dFn_norm) + Fn * (Ft_coef - np.outer(Ft, dFt_norm) / Ft_norm))
         #H = self.mu / gt_norm * np.outer(x_new, dFn_norm)# + Fn * (Ft_coef - np.outer(Ft, dFt_norm) / Ft_norm))
+
+        # get frictions and its derivative
+        slip = np.linalg.norm(x_new)
+        mu, dmu = self.get_friction_and_derivative(slip)
+        if slip > 0:
+            dmu = dmu * x_new / slip
+        else:
+            dmu = -dmu * Ft / Ft_norm
+
         Ft_trial = Ft_iter + eps_t * (x_new - x_iter)
         Ft_trial_norm = np.linalg.norm(Ft_trial)
+        assert(Ft_trial_norm != 0)
         dFt_trial_norm = Ft_trial.dot(eps_t * P) / Ft_trial_norm
-        H = Ft_coef + self.mu / Ft_norm * np.outer(Ft, dFn_norm)
-        #jac_pinv = np.linalg.pinv(jac[:,:3])
-        #jac_pinv = np.linalg.inv(jac)
-        H[:, pos * self.n_dim:(pos + 1) * self.n_dim] += self.mu * Fn / Ft_trial_norm * (eps_t * P - np.outer(Ft_trial, dFt_trial_norm) / Ft_trial_norm)
-        #H[:, pos * self.n_dim:(pos + 1) * self.n_dim] += eps_t * P + self.mu * Fn * (P - np.outer(x_new, dgt_norm) / gt_norm) / gt_norm#-jac_pinv.dot(jac_gap)[:3,:3] - eps_t * P
-        #H += eps_t * P + self.mu * Fn * (P - np.outer(x_new, dgt_norm) / gt_norm) / gt_norm#-jac_pinv.dot(jac_gap)[:3,:3] - eps_t * P
-        # no opening
-        H[:,pos*self.n_dim:(pos+1)*self.n_dim][1] += face1.area * face1.n
-        #H[1] += face1.area * face1.n
-        #Ft_next = H.dot(x_new.flatten())
-        Ft_next = H.dot(self.x_new[conn[1]].flatten())
-        #self.f[self.n_dim * cell_id:self.n_dim * (cell_id + 1)] = -Ft_next + eps_t * (x_new - x_iter) + self.mu * Fn * x_new / gt_norm#x_loc[:3]-Ft_next-Ft_prev - eps_t *(x_new-x)
-        self.f[self.n_dim * cell_id:self.n_dim * (cell_id + 1)] = -Ft_next + Ft + self.mu * Fn * Ft_trial / Ft_trial_norm#x_loc[:3]-Ft_next-Ft_prev - eps_t *(x_new-x)
+        H = Ft_coef - mu / Ft_norm * np.outer(Ft, dFn_norm)
+        H[:, pos * self.n_dim:(pos + 1) * self.n_dim] -= mu * Fn / Ft_trial_norm * (eps_t * P - np.outer(Ft_trial, dFt_trial_norm) / Ft_trial_norm)
+        H[:, pos * self.n_dim:(pos + 1) * self.n_dim] -= np.outer(Ft_trial, dmu) / Ft_trial_norm * Fn
+        # Local basis
+        H = S.dot(H).dot(np.kron(np.identity(conn[1].size), Sinv))
+        assert((np.fabs(H[2,:]) < 1.E-12).all())
+        H[2, pos * self.n_dim:(pos + 1) * self.n_dim] = S.dot(face1.n)
+        H = H.dot(np.kron(np.identity(conn[1].size), S))
 
-        #dgap = np.array([0.001, 0.0000001, 0.0000001])
-        #F1, j1 = self.local_iterations(cell_id, Fn, x_new)
-        #F2, j2 = self.local_iterations(cell_id, Fn, x_new + P.dot(dgap))
-        #jac_true = (F2[:3] - F1[:3])[:,np.newaxis] / dgap
+        self.f[self.n_dim * cell_id:self.n_dim * (cell_id + 1)] = Ft - mu * Fn * Ft_trial / Ft_trial_norm  # x_loc[:3]-Ft_next-Ft_prev - eps_t *(x_new-x)
+        self.f[self.n_dim * cell_id:self.n_dim * (cell_id + 1)] = S.dot(self.f[self.n_dim * cell_id:self.n_dim * (cell_id + 1)])
+        assert(np.fabs(self.f[self.n_dim * cell_id:self.n_dim * (cell_id + 1)][2]) < 1.E-12)
+        # Subtract what will be added while jacobian assembly in engine
+        Ft_next = H.dot(self.get_variables(conn[1], 'new').flatten())
+        self.f[self.n_dim * cell_id:self.n_dim * (cell_id + 1)] -= Ft_next
 
         return (cell_id, 0), conn[1], np.array(np.hsplit(H,conn[1].size))
         #return (cell_id, 0), np.array([cell_id]), np.array(np.hsplit(H,1))
@@ -2547,19 +2970,20 @@ class UnstructDiscretizer:
             Fn_coef = np.outer(face1.n, face1.n).dot(F_coef)
             Ft_coef = P.dot(F_coef)
             # Values
-            F = F_coef.dot(self.x_new[conn[1]].flatten())
-            Fn = face1.n.dot(F)
+            F = F_coef.dot(self.get_variables(conn[1], 'new').flatten())
+            Fn = max(0.0, face1.n.dot(F))
             Ft = P.dot(F)
 
             if self.ith_iter == 1:
                 self.Ft_prev[cell_id] = Ft
 
-            self.Ft_iter[cell_id] = P.dot(F_coef.dot(self.x_iter[conn[1]].flatten()))
+            self.Ft_iter[cell_id] = P.dot(F_coef.dot(self.get_variables(conn[1], 'iter').flatten()))
 
             #assert(self.get_fracture_sign(face1.n) == np.sign((self.Ft_iter[cell_id] * P.dot(self.x_new[cell_id] - self.x_iter[cell_id]))[0]) or np.sign((self.Ft_iter[cell_id] * P.dot(self.x_new[cell_id] - self.x_iter[cell_id]))[0]) == 0)
             eps_t = self.eps_t
             Ft_trial = self.Ft_iter[cell_id] + eps_t * P.dot(self.x_new[cell_id] - self.x_iter[cell_id])
-            Phi_trial = np.linalg.norm(Ft_trial) + self.mu * Fn
+            mu,dmu = self.get_friction_and_derivative(np.linalg.norm(P.dot(self.x_new[cell_id])))
+            Phi_trial = np.linalg.norm(Ft_trial) - mu * Fn
             if Phi_trial > 0:# or np.linalg.norm(self.x_prev[cell_id]) == 0.0:
                 # status slide
                 self.mpsa_connections[cell_id][0] = self.return_mapping(cell_id)

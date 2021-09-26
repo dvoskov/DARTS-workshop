@@ -1,11 +1,10 @@
-from darts.engines import *
-from darts.physics import *
-from darts.models.physics.iapws.iapws_property import *
-from darts.models.physics.iapws.custom_rock_property import *
-from darts.tools.keyword_file_tools import *
 from darts.models.physics.geothermal_operators import *
+from darts.models.physics.iapws.iapws_property import *
+from darts.models.physics.physics_base import PhysicsBase
+from darts.tools.keyword_file_tools import *
 
-class Geothermal:
+
+class Geothermal(PhysicsBase):
     """"
        Class to generate geothermal physics, including
         Important definitions:
@@ -16,7 +15,9 @@ class Geothermal:
             - property_evaluator
             - well_control (rate, bhp)
     """
-    def __init__(self, timer, n_points, min_p, max_p, min_e, max_e, mass_rate=False, with_gpu=False, static_itor=False):
+
+    def __init__(self, timer, n_points, min_p, max_p, min_e, max_e, mass_rate=False, grav=False,
+                 platform='cpu', itor_type='multilinear', itor_mode='adaptive', itor_precision='d', cache=True):
         """"
            Initialize Geothermal class.
            Arguments:
@@ -24,7 +25,12 @@ class Geothermal:
                 - n_points: number of interpolation points
                 - min_p, max_p: minimum and maximum pressure
                 - min_e, max_e: minimum and maximum enthalpy
+                - platform: target simulation platform - 'cpu' (default) or 'gpu'
+                - itor_type: 'multilinear' (default) or 'linear' interpolator type
+                - itor_mode: 'adaptive' (default) or 'static' OBL parametrization
+                - itor_precision: 'd' (default) - double precision or 's' - single precision for interpolation
         """
+        super().__init__(cache)
         self.timer = timer.node["simulation"]
         self.n_points = n_points
         self.min_p = min_p
@@ -44,74 +50,50 @@ class Geothermal:
         self.n_phases = len(self.phases)
         self.n_rate_temp_ops = self.n_phases
 
-        grav = 0
+        self.n_axes_points = index_vector([n_points] * self.n_vars)
+        self.n_axes_min = value_vector([min_p, min_e])
+        self.n_axes_max = value_vector([max_p, max_e])
 
-        if with_gpu:
-            plat = 'gpu'
-            plat_itor = plat
-        else:
-            plat = 'cpu'
-            plat_itor = 'i_d'
-            if static_itor:
-                plat_itor = 'static_i_d'
-
-        self.property_data = property_iapws_data()
         # evaluate names of required classes depending on amount of components, self.phases, and selected physics
-        engine_name = eval("engine_nce_%s%d" % (plat, self.n_components))
-        acc_flux_etor_name = acc_flux_custom_iapws_evaluator_python
-        acc_flux_etor_name_well = acc_flux_custom_iapws_evaluator_python_well
-        acc_flux_itor_name = eval("operator_set_interpolator_%s_%d_%d" % (plat_itor, self.n_vars, self.n_ops))
-        acc_flux_itor_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_vars, self.n_ops))
-
-        if mass_rate:
-            rate_etor_name = geothermal_mass_rate_custom_evaluator_python
+        if grav:
+            self.n_ops = 12
+            self.property_data = property_data()
+            self.engine = eval("engine_nce_g_%s%d_%d" % (platform, self.n_components, self.n_phases - 2))()
+            self.acc_flux_etor = acc_flux_gravity_evaluator_python(self.property_data)
+            self.acc_flux_etor_well = acc_flux_gravity_evaluator_python_well(self.property_data)
         else:
-            rate_etor_name = geothermal_rate_custom_evaluator_python
-            
-        rate_interpolator_name = eval("operator_set_interpolator_i_d_%d_%d" % (self.n_vars, self.n_rate_temp_ops))
-        rate_interpolator_name_long = eval("operator_set_interpolator_l_d_%d_%d" % (self.n_vars, self.n_rate_temp_ops))
+            self.n_ops = 2 * self.n_components + self.thermal * 6
+            self.property_data = property_iapws_data()
+            self.engine = eval("engine_nce_%s%d" % (platform, self.n_components))()
+            self.acc_flux_etor = acc_flux_custom_iapws_evaluator_python(self.property_data)
+            self.acc_flux_etor_well = acc_flux_custom_iapws_evaluator_python_well(self.property_data)
 
-        self.acc_flux_etor = acc_flux_etor_name(self.property_data)
-        self.acc_flux_etor_well = acc_flux_etor_name_well(self.property_data)
+        self.acc_flux_itor = self.create_interpolator(self.acc_flux_etor, self.n_vars, self.n_ops,
+                                                      self.n_axes_points, self.n_axes_min, self.n_axes_max,
+                                                      platform=platform, algorithm=itor_type, mode=itor_mode,
+                                                      precision=itor_precision)
 
-        try:
-            # try first to create interpolator with 4-byte index type
-            self.acc_flux_itor = acc_flux_itor_name(self.acc_flux_etor, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_e]), value_vector([max_p, max_e]))
-            self.acc_flux_itor_well = acc_flux_itor_name(self.acc_flux_etor_well, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_e]), value_vector([max_p, max_e]))
-        except RuntimeError:
-            # on exception (assume too small integer range) create interpolator with long index type
-            self.acc_flux_itor = acc_flux_itor_name_long(self.acc_flux_etor, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_e]), value_vector([max_p, max_e]))
-            self.acc_flux_itor_well = acc_flux_itor_name_long(self.acc_flux_etor_well, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_e]), value_vector([max_p, max_e]))
-
-        # set up timers
-        self.timer.node["jacobian assembly"] = timer_node()
-        self.timer.node["jacobian assembly"].node["interpolation"] = timer_node()
-        self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"] = timer_node()
-        self.acc_flux_itor.init_timer_node(self.timer.node["jacobian assembly"].node["interpolation"].node["acc flux interpolation"])
+        self.acc_flux_itor_well = self.create_interpolator(self.acc_flux_etor_well, self.n_vars, self.n_ops,
+                                                           self.n_axes_points, self.n_axes_min, self.n_axes_max,
+                                                           platform=platform, algorithm=itor_type, mode=itor_mode,
+                                                           precision=itor_precision)
 
         # create rate operators evaluator
-        self.rate_etor = rate_etor_name(self.property_data)
+        if mass_rate:
+            self.rate_etor = geothermal_mass_rate_custom_evaluator_python(self.property_data)
+        else:
+            self.rate_etor = geothermal_rate_custom_evaluator_python(self.property_data)
 
-        try:
-            # try first to create interpolator with 4-byte index type
-            self.rate_itor = rate_interpolator_name(self.rate_etor, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_e]), value_vector([max_p, max_e]))
-        except RuntimeError:
-            # on exception (assume too small integer range) create interpolator with long index type
-            self.rate_itor = rate_interpolator_name_long(self.rate_etor, index_vector([n_points, n_points]),
-                                                    value_vector([min_p, min_e]), value_vector([max_p, max_e]))
-
+        # interpolator platform is 'cpu' since rates are always computed on cpu
+        self.rate_itor = self.create_interpolator(self.rate_etor, self.n_vars, self.n_rate_temp_ops,
+                                                  self.n_axes_points, self.n_axes_min, self.n_axes_max,
+                                                  platform='cpu', algorithm=itor_type, mode=itor_mode,
+                                                  precision=itor_precision)
 
         # set up timers
-        self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"] = timer_node()
-        self.rate_itor.init_timer_node(self.timer.node["jacobian assembly"].node["interpolation"].node["rate interpolation"])
-
-        # create engine according to physics selected
-        self.engine = engine_name()
+        self.create_itor_timers(self.acc_flux_itor, 'reservoir interpolation')
+        self.create_itor_timers(self.acc_flux_itor_well, 'well interpolation')
+        self.create_itor_timers(self.rate_itor, 'well controls interpolation')
 
         # create well controls
         # water stream
@@ -125,7 +107,8 @@ class Geothermal:
         # water injection at constant temperature with volumetric rate control
         self.new_rate_water_inj = lambda rate, temp: gt_rate_temp_inj_well_control(self.phases, 0, self.n_vars,
                                                                                    rate, temp,
-                                                                                   self.water_inj_stream, self.rate_itor)
+                                                                                   self.water_inj_stream,
+                                                                                   self.rate_itor)
         # water production with bhp control
         self.new_bhp_prod = lambda bhp: gt_bhp_prod_well_control(bhp)
         # water production with volumetric rate control
@@ -141,7 +124,6 @@ class Geothermal:
         self.new_mass_rate_water_prod = lambda rate: gt_mass_rate_prod_well_control(self.phases, 0, self.n_vars,
                                                                                     rate, self.rate_itor)
 
-
     def init_wells(self, wells):
         """""
         Function to initialize the well rates for each well
@@ -150,7 +132,7 @@ class Geothermal:
         """
         for w in wells:
             assert isinstance(w, ms_well)
-            w.init_rate_parameters(self.n_components+1, self.phases, self.rate_itor)
+            w.init_rate_parameters(self.n_components + 1, self.phases, self.rate_itor)
 
     def set_uniform_initial_conditions(self, mesh, uniform_pressure, uniform_temperature):
         """""
@@ -173,3 +155,26 @@ class Geothermal:
 
         enthalpy = np.array(mesh.enthalpy, copy=False)
         enthalpy.fill(enth)
+
+    def set_nonuniform_initial_conditions(self, mesh, pressure_grad, temperature_grad):
+        """""
+        Function to set uniform initial reservoir condition
+        Arguments:
+            -mesh: mesh object
+            -pressure_grad, default unit [1/km]
+            -temperature_grad, default unit [1/km]
+        """
+        assert isinstance(mesh, conn_mesh)
+
+        depth = np.array(mesh.depth, copy=True)
+        # set initial pressure
+        pressure = np.array(mesh.pressure, copy=False)
+        pressure[:] = depth / 1000 * pressure_grad + 1
+
+        enthalpy = np.array(mesh.enthalpy, copy=False)
+        temperature = depth / 1000 * temperature_grad + 293.15
+
+        for j in range(mesh.n_blocks):
+            state = value_vector([pressure[j], 0])
+            E = iapws_total_enthalpy_evalutor(temperature[j])
+            enthalpy[j] = E.evaluate(state)

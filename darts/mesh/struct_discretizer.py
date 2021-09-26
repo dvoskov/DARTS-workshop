@@ -243,7 +243,10 @@ class StructDiscretizer:
         :return data: true data 3D data array
         """
         if np.isscalar(data):
-            data = data * np.ones(self.arr_shape, dtype=type(data))
+            if type(data) != int:
+                data = data * np.ones(self.arr_shape, dtype=type(data))
+            else:
+                data = data * np.ones(self.arr_shape)
         else:
             if data.ndim == 1:
                 assert data.size == self.nodes_tot, "size of %s is %s instead of %s" % (
@@ -572,6 +575,12 @@ class StructDiscretizer:
         :param skin: skin factor for pressure loss around well-bore due to formation damage
         :return well_index: well-index of particular perforation
         """
+        assert (i > 0), "Perforation block coordinate should be positive"
+        assert (j > 0), "Perforation block coordinate should be positive"
+        assert (k > 0), "Perforation block coordinate should be positive"
+        assert (i <= self.nx), "Perforation block coordinate should not exceed corresponding reservoir dimension"
+        assert (j <= self.ny), "Perforation block coordinate should not exceed corresponding reservoir dimension"
+        assert (k <= self.nz), "Perforation block coordinate should not exceed corresponding reservoir dimension"
         i -= 1
         j -= 1
         k -= 1
