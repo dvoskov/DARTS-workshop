@@ -1,8 +1,1 @@
-numpy
-matplotlib
-scipy
-pandas
-openpyxl
-meshio
-xlrd
-pykrige
+open-darts
