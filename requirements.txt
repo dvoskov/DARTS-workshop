@@ -3,7 +3,6 @@ matplotlib
 scipy
 pandas
 openpyxl
-plotly
 meshio
 xlrd
 pykrige
