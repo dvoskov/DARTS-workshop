@@ -185,7 +185,8 @@ class Model(DartsModel):
         """ Activate physics """
         if custom_physics:  # custom_physics inherits operators and physics for regions with source term
             self.physics = CustomPhysics(components, phases, self.timer,
-                                         n_points=401, min_p=1, max_p=1000, min_z=self.zero/10, max_z=1-self.zero/10, cache=0)
+                                         n_points=401, min_p=1, max_p=1000, min_z=self.zero/10, max_z=1-self.zero/10,
+                                         cache=0, volume=delta_volume, num_wells=num_well_blocks)
         else:  # default physics adds mass source term to kinetic operator in regions with source term
             self.physics = Compositional(components, phases, self.timer,
                                          n_points=401, min_p=1, max_p=1000, min_z=self.zero/10, max_z=1-self.zero/10, cache=0)
@@ -201,7 +202,7 @@ class Model(DartsModel):
             property_container.rel_perm_ev = rel_perm_ev
             property_container.kinetic_rate_ev = deepcopy(kinetic_rate_ev)  # deepcopy because mass source BC doesn't work otherwise
 
-            if custom_physics is False and mass_sources[i] is not None:
+            if not custom_physics and mass_sources[i] is not None:
                 property_container.kinetic_rate_ev[1] = mass_sources[i]
 
             self.physics.add_property_region(property_container, i)
@@ -269,10 +270,6 @@ class Model(DartsModel):
             self.op_list = [self.physics.acc_flux_itor[0], self.physics.acc_flux_w_itor, self.physics.acc_flux_itor[1],
                             self.physics.acc_flux_itor[2]]
 
-    def properties(self, state):
-        (sat, x, rho, rho_m, mu, kr, ph) = self.property_container.evaluate(state)
-        return sat[0]
-
     def print_and_plot_1D(self):
         nc = self.physics.nc
         Sg = np.zeros(self.reservoir.nb)
@@ -296,15 +293,14 @@ class Model(DartsModel):
         for ii in range(self.reservoir.nb):
             x_list = Xn[ii*nc:(ii+1)*nc]
             state = value_vector(x_list)
-            opn = self.op_num[ii]
-            (ph, sat, x, rho, rho_m, mu, kr, pc, ms) = self.physics.property_containers[opn].evaluate(state)
+            ph, sat, x, rho, rho_m, mu, kr, pc, kin_rates = self.physics.property_operators.property.evaluate(state)
 
             rel_perm[ii, :] = kr
             visc[ii, :] = mu
             density[ii, :2] = rho
             density_m[ii, :2] = rho_m
 
-            density[2] = self.physics.property_containers[opn].solid_dens[-1]
+            density[2] = self.physics.property_operators.property.solid_dens[-1]
 
             X[ii, :, 0] = x[1][:-1]
             X[ii, :, 1] = x[0][:-1]
@@ -358,7 +354,7 @@ class Model(DartsModel):
                            'size': 8,
                            }
 
-        nc = self.property_container.nc
+        nc = self.physics.nc
         Sg = np.zeros(self.reservoir.nb)
         Ss = np.zeros(self.reservoir.nb)
         X = np.zeros((self.reservoir.nb, nc - 1, 2))
@@ -375,7 +371,7 @@ class Model(DartsModel):
         for ii in range(self.reservoir.nb):
             x_list = Xn[ii * nc:(ii + 1) * nc]
             state = value_vector(x_list)
-            (sat, x, rho, rho_m, mu, kin_rates, kr, pc, ph) = self.property_container.evaluate(state)
+            ph, sat, x, rho, rho_m, mu, kr, pc, kin_rates = self.physics.property_operators.property.evaluate(state)
 
             X[ii, :, 0] = x[1][:-1]
             X[ii, :, 1] = x[0][:-1]
@@ -456,7 +452,8 @@ class ModelProperties(PropertyContainer):
 
     def evaluate_mass_source(self, pressure, temperature, zc):
         # Kinetic reaction
-        mass_source = self.kinetic_rate_ev[0].evaluate(pressure, temperature, self.x, zc[-1])
+        mass_source = np.zeros(self.nc)
+        mass_source += self.kinetic_rate_ev[0].evaluate(pressure, temperature, self.x, zc[-1])
 
         # Mass source
         if 1 in self.kinetic_rate_ev.keys():
@@ -524,12 +521,12 @@ class CustomPhysics(Compositional):
         self.wellbore_operators = ReservoirOperators(self.property_containers[0])
 
         self.reservoir_operators[1] = ReservoirWithSourceOperators(self.property_containers[0], comp_inj_id=0,
-                                                                        delta_volume=self.delta_volume,
-                                                                        num_well_blocks=self.num_well_blocks)
+                                                                   delta_volume=self.delta_volume,
+                                                                   num_well_blocks=self.num_well_blocks)
 
         self.reservoir_operators[2] = ReservoirWithSourceOperators(self.property_containers[0], comp_inj_id=1,
-                                                                        delta_volume=self.delta_volume,
-                                                                        num_well_blocks=self.num_well_blocks)
+                                                                   delta_volume=self.delta_volume,
+                                                                   num_well_blocks=self.num_well_blocks)
 
         self.rate_operators = RateOperators(self.property_containers[0])
 
